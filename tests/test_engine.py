@@ -194,51 +194,6 @@ class ResearchEngineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 engine.decide()
 
-    def test_explicit_no_workflow_instruction_uses_direct_execution_for_this_turn(self):
-        engine = self.engine(
-            question="研究噪声控制；不要调用 design_workflow，先注册假设再实验。",
-            workflow_mode="plan", use_memory=False)
-        self.assertEqual(engine.run["workflow_mode"], "react")
-        self.assertEqual(engine.run["requested_workflow_mode"], "plan")
-        engine.run["evidence_collected"] = True
-        self.assertIn("hypothesis", engine.available_tools())
-        self.assertNotIn("design_workflow", engine.available_tools())
-        follow = core.resume(engine.run, engine.folder, "继续研究不同的控制器设置和误差")
-        self.assertEqual(follow.run["workflow_mode"], "plan")
-
-    def test_verify_catalog_only_offers_unverified_completed_experiments(self):
-        engine = self.engine()
-        engine.run["experiments"] = [
-            {"id": "x1", "status": "completed", "verification": {"check": {"passed": True}}},
-            {"id": "x2", "status": "completed"},
-            {"id": "x3", "status": "failed"},
-        ]
-        schema = engine.tool_catalog(["verify"])[0]["args_schema"]
-        self.assertEqual(schema["properties"]["experiment_id"]["enum"], ["x2"])
-        with self.assertRaisesRegex(ValueError, "x2"):
-            core.protocol.validate({"experiment_id": "x1"}, schema)
-        core.protocol.validate({"experiment_id": "x2"}, schema)
-
-    def test_verifier_selects_pending_experiment_without_model_call(self):
-        engine = self.engine(workflow_mode="plan")
-        engine.run["active_agent"] = {"id": "g3", "role": "verifier"}
-        engine.run["experiments"] = [
-            {"id": "x1", "status": "completed", "verification": {"check": {"passed": True}}},
-            {"id": "x2", "status": "completed"},
-        ]
-        engine.complete = lambda *args, **kwargs: self.fail("verifier should not ask the model for an ID")
-        decision = engine.agent_step()
-        self.assertEqual((decision["tool"], decision["args"]), ("verify", {"experiment_id": "x2"}))
-
-    def test_directory_read_choice_becomes_list_files(self):
-        engine = self.engine()
-        engine.complete = lambda *args, **kwargs: (
-            {"tool": "read_file", "reason": "查看工作目录", "args": {"path": "."}},
-            {"source": "fixture"})
-        decision = engine.agent_step()
-        self.assertEqual((decision["tool"], decision["args"]), ("list_files", {"path": "."}))
-        self.assertEqual(engine.apply(decision["tool"], decision["args"])["entries"], [])
-
     def test_follow_up_continues_the_same_session(self):
         engine = self.engine()
         actions = self.actions()
@@ -472,50 +427,6 @@ class ResearchEngineTests(unittest.TestCase):
         self.assertEqual(len(engine.run["sources"]), 1)
         self.assertEqual(engine.run["sources"][0]["content"], "前段与后段")
         self.assertFalse(engine.run["sources"][0]["truncated"])
-
-    def test_truncated_fetch_reuses_same_request_but_not_other_pages_or_longer_reads(self):
-        engine = self.engine()
-        base = storage.settings()
-        url = "https://example.org/奶龙"
-        encoded = "https://example.org/%E5%A5%B6%E9%BE%99"
-        other = "https://example.org/奶蛙"
-        calls = []
-
-        def fetch(request_url, max_chars):
-            calls.append((request_url, max_chars))
-            return {"url": request_url, "title": "条目", "content": "正文" * (max_chars // 2),
-                    "fetched_at": "fixture", "truncated": True}
-
-        with patch("researchloop.storage.settings", return_value={**base, "web": {**base["web"], "enabled": True}}), \
-                patch("researchloop.webaccess.fetch", side_effect=fetch):
-            first = engine.apply("web_fetch", {"url": url, "max_chars": 3000})
-            same = engine.apply("web_fetch", {"url": encoded, "max_chars": 3000})
-            different = engine.apply("web_fetch", {"url": other, "max_chars": 3000})
-            longer = engine.apply("web_fetch", {"url": url, "max_chars": 5000})
-            refreshed = engine.apply("web_fetch", {"url": url, "max_chars": 5000, "refresh": True})
-        self.assertEqual(first["id"], same["id"])
-        self.assertTrue(same["reused"])
-        self.assertTrue(same["truncated"])
-        self.assertNotEqual(first["id"], different["id"])
-        self.assertEqual(first["id"], longer["id"])
-        self.assertEqual(calls, [(encoded, 3000), ("https://example.org/%E5%A5%B6%E8%9B%99", 3000),
-                                 (encoded, 5000), (encoded, 5000)])
-        self.assertEqual(refreshed["chars"], 5000)
-
-    def test_truncated_fetch_with_same_body_records_larger_limit(self):
-        engine = self.engine()
-        base = storage.settings()
-        url = "https://example.org/large"
-        page = {"url": url, "title": "条目", "content": "同一段正文",
-                "fetched_at": "fixture", "truncated": True}
-        with patch("researchloop.storage.settings", return_value={**base, "web": {**base["web"], "enabled": True}}), \
-                patch("researchloop.webaccess.fetch", return_value=page) as fetch:
-            engine.apply("web_fetch", {"url": url, "max_chars": 3000})
-            engine.apply("web_fetch", {"url": url, "max_chars": 5000})
-            result = engine.apply("web_fetch", {"url": url, "max_chars": 5000})
-        self.assertEqual(fetch.call_count, 2)
-        self.assertTrue(result["reused"])
-        self.assertEqual(len(engine.run["sources"]), 1)
 
     def test_uncited_article_cannot_complete_metadata_only_report(self):
         engine = self.engine()

@@ -62,14 +62,11 @@ def wrap(error, resource):
 
 def blocked(run, resource, config):
     item = run.get("resource_health", {}).get(resource) or {}
-    temporary_fetch = resource.startswith("fetch:") and item.get("kind") == "network"
-    unavailable = (item.get("cooldown_until", 0) > time.time() if temporary_fetch
-                   else item.get("blocked", False) or item.get("cooldown_until", 0) > time.time())
-    return unavailable and item.get("revision") == config.get("revision")
+    return (item.get("blocked", False) or item.get("cooldown_until", 0) > time.time()) and item.get("revision") == config.get("revision")
 
 
 def record(run, info, config, turn):
-    if info.get("kind") != "circuit_open" and (info.get("blocked") or info.get("retryable")) and info.get("resource"):
+    if (info.get("blocked") or info.get("retryable")) and info.get("resource"):
         run.setdefault("resource_health", {})[info["resource"]] = {
             **info, "revision": config.get("revision"), "turn": turn,
             "cooldown_until": time.time() + info.get("retry_after", 0) if info.get("retryable") else 0}
@@ -83,12 +80,8 @@ def resource(tool, args, config):
         name = str(args.get("platform") or "")
         return "platform:" + name if name in ("bilibili", "tieba") else "search:" + str(config["web"].get("search_provider") or "searxng")
     if tool == "web_fetch":
-        from .webaccess import normalise_url
-        raw = str(args.get("url") or "")
-        try:
-            return "fetch:" + normalise_url(raw)
-        except ValueError:
-            return "fetch:" + raw
+        from urllib.parse import urlparse
+        return "fetch:" + (urlparse(str(args.get("url") or "")).hostname or "")
     return "literature:crossref" if tool == "literature" else "tool:" + str(tool)
 
 

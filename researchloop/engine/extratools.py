@@ -46,22 +46,16 @@ def web_fetch(engine, args):
         raise ValueError("联网工具未启用：请先在设置中启用并配置搜索服务")
     url = str(args.get("url") or "")
     url = webaccess.normalise_url(url) if url else url
-    maximum = max(200, min(int(args.get("max_chars") or config.get("fetch_max_chars") or 6000),
-                           webaccess.HARD_MAX_CHARS))
     existing = next((source for source in engine.run["sources"]
-                     if (source.get("request_url") or source.get("url")) == url and source.get("content")), None)
-    if existing and not args.get("refresh") and (
-            existing.get("truncated") is False or
-            existing.get("fetch_max_chars", len(existing["content"])) >= maximum):
-        content = existing["content"][:maximum]
-        truncated = bool(existing.get("truncated") or len(existing["content"]) > maximum)
-        engine.run["evidence_collected"] = True
-        return {"id": existing["id"], "url": existing["url"], "title": existing["title"],
-                "content": content, "chars": len(content), "truncated": truncated, "reused": True,
-                "note": "复用本轮相同请求的正文；重复读取不是独立来源。"}
-    page = webaccess.fetch(url, max_chars=maximum)
+                     if source.get("url") == url and source.get("content")), None)
+    if existing and existing.get("truncated") is False:
+        return {"id": existing["id"], "url": url, "title": existing["title"],
+                "content": existing["content"], "chars": len(existing["content"]),
+                "truncated": False, "reused": True,
+                "note": "本轮已读取完整页面，直接复用已有正文；重复读取不是独立来源。"}
+    page = webaccess.fetch(url, max_chars=args.get("max_chars") or config.get("fetch_max_chars") or 6000)
     existing = next((source for source in engine.run["sources"]
-                     if source.get("url") == page["url"] or source.get("request_url") == url), None)
+                     if source.get("url") == page["url"]), None)
     if existing and (not existing.get("content") or page["content"] == existing["content"] or
                      page["content"].startswith(existing["content"])):
         if not existing.get("content"):
@@ -69,12 +63,8 @@ def web_fetch(engine, args):
             existing["evidence_scope"] = "网页正文"
         if not existing.get("content") or len(page["content"]) > len(existing["content"]):
             existing.update(content=page["content"], content_chars=len(page["content"]),
-                            truncated=page["truncated"], fetched_at=page["fetched_at"],
-                            fetch_max_chars=maximum, request_url=url)
+                            truncated=page["truncated"], fetched_at=page["fetched_at"])
             existing.setdefault("abstract", page["content"][:1800])
-        else:
-            existing["fetch_max_chars"] = max(existing.get("fetch_max_chars", 0), maximum)
-            existing.setdefault("request_url", url)
         engine.run["evidence_collected"] = True
         return {"id": existing["id"], "url": page["url"], "title": existing["title"],
                 "content": existing["content"], "chars": len(existing["content"]),
@@ -86,7 +76,7 @@ def web_fetch(engine, args):
     entry = {"id": f"p{len(engine.run['sources']) + 1}", "title": page["title"], "url": page["url"],
              "abstract": page["content"][:1800], "content": page["content"], "evidence_scope": "网页正文",
              "fetched_at": page["fetched_at"], "content_chars": len(page["content"]),
-             "truncated": page["truncated"], "fetch_max_chars": maximum, "request_url": url}
+             "truncated": page["truncated"]}
     engine.run["sources"].append(entry)
     engine.run["evidence_collected"] = True
     return {"id": entry["id"], "url": page["url"], "title": page["title"],
@@ -161,8 +151,8 @@ registry.register_tool("web_search", web_search,
                        description="搜索外部网页信息，适合最新消息、陌生实体或需要来源核实时使用。",
                        arguments={"query": "搜索关键词", "max_results": 5, "recency": "any"}, required=["query"])
 registry.register_tool("web_fetch", web_fetch,
-                       description="读取指定 http/https URL 的网页正文，直接返回 content；相同请求复用本轮正文，明确需要重新抓取时设 refresh=true；网页不在本地 workspace，不能用 read_file 读取。",
-                       arguments={"url": "要读取的 URL", "max_chars": 6000, "refresh": False}, required=["url"])
+                       description="读取指定 http/https URL 的网页正文，直接返回 content；网页不在本地 workspace，不能用 read_file 读取。",
+                       arguments={"url": "要读取的 URL", "max_chars": 6000}, required=["url"])
 registry.register_tool("remember_fact", remember_fact,
                        description="基于已有证据ID暂存事实候选；完成报告引用全部证据后才写入记忆。必须附evidence_ids，不能把推测写成事实。",
                        arguments={"predicate": "事实谓词", "object": "事实对象", "summary": "简短摘要",

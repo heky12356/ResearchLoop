@@ -65,8 +65,6 @@ def list_files(engine, args):
 
 def read_file(engine, args):
     path = target(engine, args['path'])
-    if path.is_dir():
-        raise ValueError('路径是目录，请使用 list_files 列出文件')
     maximum = max(1,min(40000,int(args.get('max_chars',16000))))
     with path.open('rb') as handle:
         raw = handle.read(maximum*4+1)

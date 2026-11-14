@@ -75,8 +75,7 @@ ARGUMENTS = {
     "web_search": ({"query": {"type": "string"},
                     "max_results": {"type": "integer"}, "recency": {"type": "string", "enum": ["any", "day", "week", "month", "year"]}},
                    ["query"]),
-    "web_fetch": ({"url": {"type": "string"}, "max_chars": {"type": "integer"},
-                   "refresh": {"type": "boolean"}}, ["url"]),
+    "web_fetch": ({"url": {"type": "string"}, "max_chars": {"type": "integer"}}, ["url"]),
     "remember_fact": ({"predicate": {"type": "string"}, "object": {"type": "string"}, "summary": {"type": "string"},
                        "tags": {"type": "array", "items": {"type": "string"}}, "confidence": {"type": "number"},
                        "source_message": {"type": "string"}}, ["predicate", "object", "summary"]),
@@ -338,10 +337,6 @@ class ResearchEngine:
             properties = copy.deepcopy(properties)
             if name == "platform_search":
                 properties["platform"]["enum"] = self.available_platforms()
-            if name == "verify":
-                properties["experiment_id"]["enum"] = [
-                    item["id"] for item in self.run["experiments"]
-                    if item.get("status") == "completed" and not item.get("verification")]
             if name in ("finish", "remember_fact"):
                 field = "citations" if name == "finish" else "evidence_ids"
                 properties[field] = {"type": "array", "items": {"type": "string"}}
@@ -399,12 +394,6 @@ class ResearchEngine:
         """The model chooses the next tool itself; the controller only gates validity."""
         run = self.run
         options = self.available_tools()
-        if (run.get("active_agent") or {}).get("role") == "verifier" and "verify" in options:
-            pending = next((item for item in run["experiments"]
-                            if item.get("status") == "completed" and not item.get("verification")), None)
-            if pending:
-                return {"tool": "verify", "reason": "复核尚未复核的成功实验",
-                        "args": {"experiment_id": pending["id"]}, "source": "controller"}
         schema = protocol.action_schema(self.tool_catalog(options))
         def compact(value, limit=600):
             raw = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "")
@@ -447,12 +436,6 @@ class ResearchEngine:
         if (run.get("active_agent") or {}).get("role") == "experimenter":
             prompt["instruction"] += ("当前是实验阶段，不能调用finish。若还没有假设，先调用hypothesis注册可检验的指标与阈值；"
                                       "再调用experiment实际运行。实验不可执行时保留原因，后续报告阶段再总结。")
-        if (run.get("active_agent") or {}).get("id") == "g0" and not run.get("workflow"):
-            prompt["instruction"] += "当前只设计工作流，假设与实验由后续阶段执行；不要选择未列出的工具。"
-        if "verify" in options:
-            prompt["pending_verification_ids"] = [
-                item["id"] for item in run["experiments"]
-                if item.get("status") == "completed" and not item.get("verification")]
         prompt['execution_context'] = {'workspace':str(self.folder/'workspace'), 'access_mode':run.get('access_mode','approval'),
                                        'available_shells':[name for name,path in engineering.shells().items() if path],
                                        'model_profiles':{name:conf for name,conf in (run.get('routing') or {}).get('profiles',{}).items() if conf.get('model')},
@@ -500,11 +483,6 @@ class ResearchEngine:
             tool = str(parsed.get("tool") or "").strip() if isinstance(parsed, dict) else ""
             args = parsed.get("args") if isinstance(parsed, dict) else None
             try:
-                if (tool == "read_file" and "list_files" in options and isinstance(args, dict)
-                        and isinstance(args.get("path"), str)):
-                    candidate = engineering.target(self, args["path"])
-                    if candidate.is_dir():
-                        tool, args = "list_files", {"path": args["path"]}
                 if tool not in options:
                     raise ValueError(f"tool={tool!r} 不在可用集合 {options}")
                 if not isinstance(parsed.get("reason"), str) or not str(parsed.get("reason")).strip():
@@ -608,8 +586,6 @@ class ResearchEngine:
             add("design_workflow")
         if not run.get("plan"):
             add("plan")
-            if run.get("workflow_mode") != "plan" and run.get("evidence_collected"):
-                add("hypothesis")
         else:
             add("hypothesis")
         # A follow-up turn clears the plan but keeps registered hypotheses and experiments.
@@ -828,19 +804,10 @@ class ResearchEngine:
                 can_retry = (tool in reliability.READ_TOOLS and info.get("retryable") and attempt < 2 and
                              delay <= 30 and self.seconds_left() > delay + 2 and
                              (self.run.get("max_steps") is None or len(self._turn_steps()) + 1 < self.run["max_steps"]))
-                if info.get("retryable") and attempt >= 2 and tool == "web_fetch" and info.get("kind") == "network":
-                    info["blocked"] = True
-                    info["retry_after"] = 30
-                    info["message"] += " 此网址已达到两次尝试上限，短暂冷却；保留错误并如实报告。"
-                elif info.get("retryable") and attempt >= 2:
+                if info.get("retryable") and attempt >= 2:
                     info["blocked"] = True
                     info["message"] += " 已达到两次尝试上限，本轮改用其他来源。"
-                prior_health = self.run.get("resource_health", {}).get(info.get("resource")) or {}
-                fetch_cooldown = (tool == "web_fetch" and
-                                  (info.get("kind") == "network" or
-                                   info.get("kind") == "circuit_open" and prior_health.get("kind") == "network"))
-                info["action"] = ("retry" if can_retry else "defer" if fetch_cooldown else
-                                  "switch_source" if info.get("blocked") else "repair_decision")
+                info["action"] = "retry" if can_retry else "switch_source" if info.get("blocked") else "repair_decision"
                 if info.get("retryable") and not can_retry and attempt < 2:
                     info["action"] = "defer"
                     info["message"] += " 当前预算或等待上限不允许立即重试。"
@@ -1077,10 +1044,6 @@ class ResearchEngine:
         cfg = storage.settings()
         resource = reliability.resource(tool, args, cfg)
         if reliability.blocked(self.run, resource, cfg):
-            health = self.run.get("resource_health", {}).get(resource) or {}
-            if resource.startswith("fetch:") and health.get("kind") == "network":
-                raise reliability.Failure("该请求刚失败，正在短暂冷却；保留原始错误，稍后可重试。",
-                                          resource=resource, kind="circuit_open", blocked=True)
             raise reliability.Failure("该服务当前配置已被停用，未再次发起请求。请换来源或修复配置。",
                                       resource=resource, kind="circuit_open", blocked=True)
         return registry.dispatch(self, tool, args)
@@ -1268,13 +1231,6 @@ class ResearchEngine:
         (self.folder / "report.md").write_text("\n\n---\n\n".join(sections) or current, encoding="utf-8")
 
 
-def _workflow_mode(mode, question):
-    if mode == "plan" and re.search(
-            r"(?:不要|禁止|别|无需)\s*(?:调用|使用)?\s*[`'\"]?design_workflow\b", question, re.I):
-        return "react"
-    return mode
-
-
 def create(body):
     question = str(body.get("question", "")).strip()
     if not 8 <= len(question) <= 3000:
@@ -1315,10 +1271,9 @@ def create(body):
         model = str(body.get("model") or cfg["model"])
         if not model or "cloud" in model.lower() or len(model) > 120:
             raise ValueError("只允许已有的本地Ollama模型")
-    requested_mode = str(body.get("workflow_mode") or "react").strip().lower()
-    if requested_mode not in ("react", "plan"):
+    mode = str(body.get("workflow_mode") or "react").strip().lower()
+    if mode not in ("react", "plan"):
         raise ValueError("workflow_mode 只能是 react 或 plan")
-    mode = _workflow_mode(requested_mode, question)
     role_models = body.get("roles") if isinstance(body.get("roles"), dict) else {}
     identifier = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     folder = storage.RUNS / identifier
@@ -1382,8 +1337,7 @@ def create(body):
            "experience": experience, "memory_version": experience["version"] if experience else 0,
            "memory_context": context, "memory_mode": "auto" if body.get("use_memory", True) else "disabled",
            "model_source": source, "provider": provider, "cloud_enabled": source == "cloud",
-           "workflow_mode": mode, "requested_workflow_mode": requested_mode,
-           "roles": role_models, "routing": routing.clean(body.get("routing") or cfg.get("routing")), "workflow": None, "agents": [], "active_agent": None,
+           "workflow_mode": mode, "roles": role_models, "routing": routing.clean(body.get("routing") or cfg.get("routing")), "workflow": None, "agents": [], "active_agent": None,
            'access_mode':access_mode,'permission_grants':[],'approval_requests':[],
            "source_hash": storage.fingerprint(manifest)}
     storage.write_json(folder / "run.json", run)
@@ -1402,8 +1356,6 @@ def resume(run, folder, question, *, token_limit=None, seconds_limit=None, max_s
                       "at": run.get("created_at"), "status": run.get("status", "completed")})
     turns.append({"id": f"t{len(turns) + 1}", "question": text, "at": storage.now(), "status": "queued"})
     run["current_question"] = text
-    run["workflow_mode"] = _workflow_mode(
-        run.get("requested_workflow_mode", run.get("workflow_mode", "react")), text)
     context = memory.recall(text)
     run["memory_context"], run["experience"] = context, context.get("method")
     run["memory_version"] = (context.get("method") or {}).get("version", 0)

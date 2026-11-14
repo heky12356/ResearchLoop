@@ -74,36 +74,6 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
         self.assertNotIn('web_search', engine.available_tools())
         self.assertEqual(engine.run['steps'][-1]['observation']['recovery']['action'], 'switch_source')
-        engine.run['resource_health']['search:tavily']['cooldown_until'] = 0
-        self.assertTrue(reliability.blocked(engine.run, 'search:tavily', self.cfg))
-
-    def test_fetch_timeout_cools_only_exact_url_then_recovers(self):
-        engine = self.engine()
-        url = 'https://example.com/one'
-        other = 'https://example.com/two'
-        page = lambda address: {'url': address, 'title': '页面', 'content': '实际正文',
-                                'fetched_at': 'fixture', 'truncated': False}
-        with patch('researchloop.webaccess.fetch', side_effect=[
-                urllib.error.URLError(TimeoutError('handshake timed out')),
-                urllib.error.URLError(TimeoutError('read timed out')),
-                page(other), page(url)]) as fetch:
-            engine._perform_tool({'tool': 'web_fetch', 'args': {'url': url}})
-            self.assertEqual(fetch.call_count, 2)
-            self.assertEqual(engine.run['steps'][-1]['observation']['recovery']['action'], 'defer')
-            resource = reliability.resource('web_fetch', {'url': url}, self.cfg)
-            self.assertTrue(reliability.blocked(engine.run, resource, self.cfg))
-            engine._perform_tool({'tool': 'web_fetch', 'args': {'url': url}})
-            self.assertEqual(fetch.call_count, 2)
-            self.assertEqual(engine.run['resource_health'][resource]['kind'], 'network')
-            self.assertEqual(engine.run['steps'][-1]['observation']['recovery']['action'], 'defer')
-            engine._perform_tool({'tool': 'web_fetch', 'args': {'url': other}})
-            self.assertEqual(fetch.call_count, 3)
-            engine.run['resource_health'][resource]['cooldown_until'] = 0
-            self.assertFalse(reliability.blocked(engine.run, resource, self.cfg))
-            engine._perform_tool({'tool': 'web_fetch', 'args': {'url': url}})
-        self.assertEqual(fetch.call_count, 4)
-        self.assertEqual(engine.run['steps'][-1]['status'], 'completed')
-        self.assertEqual([source['url'] for source in engine.run['sources']], [other, url])
 
     def test_revised_settings_reopen_previously_failed_provider(self):
         engine = self.engine()

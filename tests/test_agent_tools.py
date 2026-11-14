@@ -89,8 +89,6 @@ class AgentToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.engine.apply('write_file',{'path':path,'content':'no'})
         self.engine.apply('write_file',{'path':'code/test.py','content':'print(2)'})
         self.assertIn('print(2)',self.engine.apply('read_file',{'path':'code/test.py'})['content'])
-        with self.assertRaisesRegex(ValueError, '请使用 list_files'):
-            self.engine.apply('read_file', {'path': '.'})
         self.assertFalse(self.engine.run['approval_requests'])
 
     def test_uploaded_source_is_available_in_isolated_workspace(self):

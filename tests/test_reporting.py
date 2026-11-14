@@ -38,6 +38,9 @@ class ReportingTests(unittest.TestCase):
         self.engine.run.update(research_kind='qualitative', plan={'method': '固定夹具验证', 'limitations': '不是真实研究'},
                                sources=[{'id': 'p1', 'title': '测试夹具来源', 'url': 'https://example.org/fixture',
                                          'abstract': '仅供测试的来源摘录。', 'evidence_scope': '网页正文（测试夹具）'}])
+        self.engine.apply('assess_source', {'source_id': 'p1', 'verdict': 'supports',
+                          'quote': '仅供测试的来源摘录。', 'claim': '测试来源确有该摘录',
+                          'reason': '原文可核对', 'limitation': '仅适用于测试夹具'})
 
     def finish(self, paper=True):
         args = {'conclusion': '测试证据只适用于本测试夹具，不代表真实研究结论。', 'citations': ['p1'], 'lesson': ''}

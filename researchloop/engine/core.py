@@ -20,6 +20,7 @@ from researchloop.engine import registry
 from researchloop.engine import roles
 from researchloop.engine import workflow as workflow_module
 from researchloop.engine import extratools  # registers web_search/web_fetch/remember_fact/get_memory_context
+from researchloop.engine import source_assessment
 from researchloop.engine import doctools  # noqa: F401  registers read_docx/read_pptx/read_pdf
 from researchloop import memory, reliability, llmjson, reporting
 from researchloop.ollama import Budget, BudgetError
@@ -36,8 +37,8 @@ SYSTEM = """你是执行科研的Agent。输入是开放研究问题，而不是
 你根据工具返回的真实证据决定下一步：检查材料/检索，注册可证伪假设，设计并运行Python实验，独立重跑验证，再根据结果修正或结束。
 每次只调用一个工具；不预设结果，不编造文献和数据。工具失败时根据错误修复代码或换方法；已经成功的工具不要无意义重复。
 没有用户数据时可以设计数值模拟，但必须明确模拟假设，不声称真实世界结论；不能以模拟替代原问题所需的真实实验或数据。文献元数据不等于论文结论。
-证据不足不是结论：在plan里写清缺口后，必须继续换关键词/别名、换平台、抓正文页、查文献或读材料取证；至少尝试三种不同来源后再评估可行性。
-先inspect，再hypothesis，然后experiment、verify、finish是常见顺序，但你可按研究需要检索、读取、提出新假设或修正失败实验。
+先判断问题需要哪类证据。需要外部事实或真实世界效果时，缺少证据须换关键词/平台、抓正文、查文献或读材料；若问题可由本地计算或模拟检验，可先plan设计可证伪假设、指标与实验，再实际运行和独立复核，无须先检索。模拟结论仅限于所设机制。
+plan、hypothesis、experiment、verify、finish是本地实验的常见顺序；材料或外部事实问题可按需检索、读取、提出新假设或修正失败实验。
 Python只能用np(numpy)、math、statistics；随机数必须用提供的rng。提供load_csv('a1')返回字符串字典列表、load_text('a1')返回文本。
 实验必须实际计算并emit_result({'metrics': {'预注册指标名': float(实测值)}, 'notes':'方法说明'})。不能填写预想常数冒充实测值。
 不导入os/sys/文件/网络，不使用np.random或自定固定随机种子；命名空间已提供 rng 变量，直接用 rng.normal/rng.uniform，不要为 rng 重新赋值或新建生成器；verify会用新的隐藏种子运行同一份代码。只写精简代码。
@@ -46,7 +47,7 @@ Python只能用np(numpy)、math、statistics；随机数必须用提供的rng。
 finish是最后一步：有可引用证据时写出结论、局限、引用IDs和lesson；确实取不到证据时，说明已尝试的来源与缺口并明确未完成。每次运行都必须以报告与终态结束，不能停在“不可行判断”。
 自主选择下一项工具；严格返回 {"tool":"工具名","reason":"选择依据","args":{工具参数}}，不要把参数直接放在顶层。定性和文献问题可以采用证据分析，无须强行运行数值实验。
 异常或玩笑式提问也应先核实前提、语境或出处，不能在取得证据前直接认定它是梗或无研究价值。工作流目标也是待检验设想，不是已知事实。
-记忆和错误日志不是研究证据；finish.citations只能从allowed_citation_ids选择，没有证据时用[]明确报告未完成。401/403应换来源或修复配置，不能只改关键词重复访问同一服务。"""
+记忆和错误日志不是研究证据；检索来源先用 assess_source 依据当前问题核对原文、判断适用性和局限，再在 finish 引用。标题只能支持标题所能证明的事项。finish.citations只能从allowed_citation_ids选择，没有证据时用[]明确报告未完成。401/403应换来源或修复配置，不能只改关键词重复访问同一服务。"""
 
 ACTION_SCHEMA = {"type": "object", "properties": {
     "tool": {"type": "string", "enum": [t["name"] for t in tools.TOOLS]}, "reason": {"type": "string"},
@@ -76,6 +77,10 @@ ARGUMENTS = {
                     "max_results": {"type": "integer"}, "recency": {"type": "string", "enum": ["any", "day", "week", "month", "year"]}},
                    ["query"]),
     "web_fetch": ({"url": {"type": "string"}, "max_chars": {"type": "integer"}}, ["url"]),
+    "assess_source": ({"source_id": {"type": "string"},
+                       "verdict": {"type": "string", "enum": ["supports", "context", "reject"]},
+                       **{key: {"type": "string"} for key in ("quote", "claim", "reason", "limitation")}},
+                      ["source_id", "verdict", "claim", "reason", "limitation"]),
     "remember_fact": ({"predicate": {"type": "string"}, "object": {"type": "string"}, "summary": {"type": "string"},
                        "tags": {"type": "array", "items": {"type": "string"}}, "confidence": {"type": "number"},
                        "source_message": {"type": "string"}}, ["predicate", "object", "summary"]),
@@ -337,6 +342,8 @@ class ResearchEngine:
             properties = copy.deepcopy(properties)
             if name == "platform_search":
                 properties["platform"]["enum"] = self.available_platforms()
+            if name == "assess_source":
+                properties["source_id"]["enum"] = [source["id"] for source in self.run["sources"]]
             if name in ("finish", "remember_fact"):
                 field = "citations" if name == "finish" else "evidence_ids"
                 properties[field] = {"type": "array", "items": {"type": "string"}}
@@ -386,7 +393,8 @@ class ResearchEngine:
                        for row in self.run.get(group, [])})
 
     def memory_evidence_ids(self):
-        sources = [row for row in self.run.get("sources", []) if "只有元数据" not in str(row.get("evidence_scope") or "")]
+        sources = [row for row in self.run.get("sources", [])
+                   if (source_assessment.current(self, row["id"]) or {}).get("verdict") == "supports"]
         return sorted({row["id"] for row in [*self.run.get("assets", []), *sources]} |
                       {row["id"] for row in self.run.get("experiments", []) if row.get("verification")})
 
@@ -405,7 +413,7 @@ class ResearchEngine:
         prompt = {"question": self.question_text(), "branch_note": run.get("branch_note"),
                   "branch_context": run.get("branch_context"), "decision_feedback": run.get("decision_feedback"),
                   "recovery": run.get("recovery_feedback"), "allowed_citation_ids": self.evidence_ids(),
-                  "citation_policy": "记忆ID不能引用。无证据可用时必须 citations=[]，说明尚未核实并以未完成状态收尾。", "plan": run.get("plan"),
+                  "citation_policy": "记忆ID不能引用。经独立复核的本轮实验ID可作为实测证据引用；无实测或来源证据时 citations=[]，说明尚未核实并以未完成状态收尾。", "plan": run.get("plan"),
                   "research_kind": run.get("research_kind"), "assets": run["assets"][:4],
                   "documents": run.get("documents", [])[:6], "hypotheses": run["hypotheses"][:6],
                   "experiments": [{key: experiment.get(key) for key in
@@ -413,6 +421,9 @@ class ResearchEngine:
                                   for experiment in run["experiments"][-6:]],
                   "evidence": [{key: source.get(key) for key in ("id", "title", "evidence_scope")}
                                for source in run["sources"][-12:]],
+                  "source_assessments": [
+                      review for source in run["sources"][-12:]
+                      if (review := source_assessment.current(self, source["id"]))],
                   "evidence_count": len(run["sources"]),
                   "memory": {"text": str((run.get("memory_context") or {}).get("text") or "")[:1200]}
                   if run.get("memory_context") else None,
@@ -421,21 +432,32 @@ class ResearchEngine:
                   "gap_fill": run.get("gap_fill"), "feasibility": run.get("feasibility"),
                   "allowed_tools": self.tool_catalog(options),
                   "instruction": "你决定下一步：从allowed_tools选一个tool并给出符合其args_schema的args。"
-                                 "证据不足可继续取证；实验完成后应复核。有证据时引用合法ID形成结论。"
-                                 "若证据或服务不足，允许finish(citations=[])如实报告尚未核实和未完成；不要用模拟或计数替代真实证据。"
+                                 "外部事实证据不足可继续取证；可执行的本地问题可先plan，再注册假设、实验及独立复核。"
+                                 "实验完成后应复核并引用实验ID；无实测或来源证据时finish(citations=[])如实报告未完成。"
+                                 "模拟只能回答模拟机制内的问题，不能替代真实世界所需的数据。"
                                  "feasible=false 或 gap_fill.required 表示当前证据不足，不是终点：先换来源继续取证，"
                                  "达到要求的尝试后才能重新 plan 或 finish；每次运行都要以报告结束。"
                                  "如果需要多阶段编排，先调用design_workflow并写明每个阶段的设计理由。"}
         if "design_workflow" in options:
             prompt["role_tools"] = workflow_module.role_tools()
-            prompt["instruction"] += ("规划阶段先判断问题需要的证据。定性、文献和概念比较只安排取证、分析、报告；"
-                                      "只有明确可执行的数值问题、指标和假设时才安排实验与复核。"
+            prompt["instruction"] += ("规划阶段先判断问题需要的证据。定性、文献和概念比较安排取证、分析、报告；"
+                                      "无需外部资料即可检验的本地计算或模拟可安排实验与复核，由模型先制定计划及可证伪假设。"
+                                      "真实世界效果仍需相关数据，模拟结果只能解释模拟机制。"
                                       "实验角色没有finish权限；缺少假设时先注册。无论取证是否成功，最后安排reporter总结结论或证据缺口。"
                                       "role_tools 列出各角色能用的工具，自定义阶段名按 generalist；stages[].tools 通常省略，"
                                       "填写时只能取自该阶段角色的 role_tools，不能照抄你此刻的 allowed_tools。")
         if (run.get("active_agent") or {}).get("role") == "experimenter":
-            prompt["instruction"] += ("当前是实验阶段，不能调用finish。若还没有假设，先调用hypothesis注册可检验的指标与阈值；"
+            prompt["instruction"] += ("当前是实验阶段，不能调用finish。若还没有计划，先用plan说明可执行方法和适用边界；"
+                                      "若还没有假设，先调用hypothesis注册可检验的指标与阈值；"
                                       "再调用experiment实际运行。实验不可执行时保留原因，后续报告阶段再总结。")
+        if "assess_source" in options:
+            prompt["source_candidates"] = [
+                {"id": source["id"], "title": source.get("title"), "scope": source.get("evidence_scope"),
+                 "excerpt": str(source.get("content") or source.get("text") or source.get("abstract")
+                                or source.get("snippet") or source.get("title") or "")[:1600]}
+                for source in run["sources"][-6:]]
+            prompt["instruction"] += ("评估来源须引用 source_candidates 中真实出现的片段；根据本题区分支持、背景或不适用，"
+                                      "明确实际能支持的说法及局限。需要更多正文可先抓取或读取，不得凭标题推断文章结论。")
         prompt['execution_context'] = {'workspace':str(self.folder/'workspace'), 'access_mode':run.get('access_mode','approval'),
                                        'available_shells':[name for name,path in engineering.shells().items() if path],
                                        'model_profiles':{name:conf for name,conf in (run.get('routing') or {}).get('profiles',{}).items() if conf.get('model')},
@@ -446,8 +468,10 @@ class ResearchEngine:
             # Report prose needs content and actual measurements, not source titles alone.
             selected_sources = []
             seen_urls = set()
+            supported = [source for source in run["sources"]
+                         if (source_assessment.current(self, source["id"]) or {}).get("verdict") == "supports"]
             with_body = [source for source in run["sources"] if source.get("content") or source.get("text")]
-            for source in [*reversed(with_body[-4:]), *reversed(run["sources"])]:
+            for source in [*reversed(supported), *reversed(with_body[-4:]), *reversed(run["sources"])]:
                 key = source.get("url") or source["id"]
                 if key in seen_urls:
                     continue
@@ -457,7 +481,8 @@ class ResearchEngine:
                     break
             prompt["report_evidence"] = [{"id": source["id"], "title": source.get("title"),
                                           "scope": source.get("evidence_scope"),
-                                          "excerpt": str(source.get("text") or source.get("content") or source.get("abstract") or "")[:2200]}
+                                          "excerpt": str(source.get("text") or source.get("content") or source.get("abstract") or "")[:2200],
+                                          "assessment": source_assessment.current(self, source["id"])}
                                          for source in selected_sources]
             prompt["report_measurements"] = [{key: experiment.get(key) for key in
                                                ("id", "hypothesis_id", "result", "check", "verification", "error")}
@@ -524,13 +549,14 @@ class ResearchEngine:
         if not run.get("plan"):
             return "plan", None
         web = storage.settings()["web"]
-        if web.get("enabled") and not any(s["tool"] in ("web_search", "literature") for s in run["steps"]):
+        empirical_only = run.get("research_kind") == "simulation"
+        if not empirical_only and web.get("enabled") and not any(s["tool"] in ("web_search", "literature") for s in run["steps"]):
             return "web_search", None
-        if web.get("enabled") and any(s["tool"] == "web_search" and s["status"] == "completed" for s in run["steps"]) \
+        if not empirical_only and web.get("enabled") and any(s["tool"] == "web_search" and s["status"] == "completed" for s in run["steps"]) \
                 and not any(s["tool"] == "web_fetch" for s in run["steps"]):
             return "web_fetch", None
         query = run["plan"].get("literature_query", "").strip()
-        if query and not any(s["tool"] == "literature" for s in run["steps"]):
+        if not empirical_only and query and not any(s["tool"] == "literature" for s in run["steps"]):
             return "literature", {"query": query}
         if not run["hypotheses"]:
             return "hypothesis", None
@@ -595,8 +621,12 @@ class ResearchEngine:
             add("verify")
         if any(experiment.get("verification") for experiment in run.get("experiments", [])):
             add("reflect")
-        if run.get("sources") or run.get("assets") or any(e.get("verification") for e in run.get("experiments", [])):
+        if run.get("assets") or any(e.get("verification") for e in run.get("experiments", [])) or any(
+                (source_assessment.current(self, source["id"]) or {}).get("verdict") == "supports"
+                for source in run.get("sources", [])):
             add("remember_fact")
+        if run.get("sources"):
+            add("assess_source")
         if run.get("plan") or not (run.get("sources") or run.get("assets") or run.get("experiments")):
             add("finish")
         role = (agent.get("role") or "") if isinstance(agent, dict) else ""
@@ -604,7 +634,8 @@ class ResearchEngine:
             permitted = set(roles.tools_for(role))
             names = [name for name in names if name in permitted]
             if role == "reporter" and not (run.get("gap_fill") or {}).get("required"):
-                names = ["finish"]
+                names = ["assess_source", "finish"] if "assess_source" in names and any(
+                    source_assessment.current(self, source["id"]) is None for source in run["sources"]) else ["finish"]
             elif run.get("workflow_mode") == "plan" and role != "reporter":
                 names = [name for name in names if name != "finish"]
             if not names:
@@ -654,8 +685,9 @@ class ResearchEngine:
 
     def infer_kind(self):
         run = self.run
-        scopes = [str(source.get("evidence_scope") or "") for source in run.get("sources", [])]
-        if run.get("documents") or any("网页正文" in scope or "网页搜索摘要" in scope for scope in scopes):
+        if run.get("experiments") and (run.get("sources") or run.get("documents")):
+            return "mixed"
+        if run.get("documents"):
             return "mixed"
         if run.get("sources"):
             return "literature"
@@ -1010,8 +1042,8 @@ class ResearchEngine:
                 continue
             skip_reason = ""
             if stage["role"] == "experimenter" and not self.run.get("hypotheses") and (
-                    not self.run.get("plan") or self.run.get("research_kind") in ("qualitative", "literature")
-                    or self.run.get("plan", {}).get("feasible") is False):
+                    self.run.get("research_kind") in ("qualitative", "literature")
+                    or (self.run.get("plan") or {}).get("feasible") is False):
                 skip_reason = "研究方法无需数值实验，或尚无可执行的实验计划"
             elif stage["role"] == "verifier" and not any(
                     experiment.get("status") == "completed" and not experiment.get("verification")
@@ -1025,6 +1057,11 @@ class ResearchEngine:
                 continue
             self.event("stage", f"阶段 {agent['id']}（{stage.get('label') or stage['role']}）：{stage['goal']}", status="running")
             stage_limit = int(stage.get("max_steps", 3))
+            if stage["role"] == "experimenter" and not self.run.get("plan") and not self.run.get("hypotheses"):
+                stage_limit = max(stage_limit, 3)
+            if stage["role"] == "reporter" and self.run.get("sources") and not any(
+                    source_assessment.current(self, source["id"]) for source in self.run["sources"]):
+                stage_limit = max(stage_limit, 2)
             if stage["role"] == "reporter" and (self.run.get("gap_fill") or {}).get("required"):
                 remaining = max(0, GAP_FILL_MIN - self.run["gap_fill"].get("attempts", 0))
                 stage_limit = max(stage_limit, remaining + 1)
@@ -1107,8 +1144,10 @@ class ResearchEngine:
                         "note": extracted["note"], "truncated": extracted["truncated"]}
             return {"id": asset["id"], "text": (self.folder / "inputs" / asset["id"]).read_text(encoding="utf-8-sig")[:12000]}
         if tool == "hypothesis":
-            if not run.get("evidence_collected"):
-                raise ValueError("先检查材料或收集证据")
+            if not run.get("evidence_collected") and not (
+                    (run.get("plan") or {}).get("feasible") is True
+                    and run.get("research_kind") in ("simulation", "quantitative")):
+                raise ValueError("先检查材料或收集证据；自洽的本地实验可先plan说明方法与边界")
             if not all(isinstance(args.get(k), str) and args[k].strip() for k in ("statement", "prediction", "controls", "metric")):
                 raise ValueError("假设需要statement、prediction、controls、metric")
             metric_name = str(args["metric"]).strip()
@@ -1171,13 +1210,12 @@ class ResearchEngine:
             verified = [e for e in run["experiments"] if e.get("verification") and e["id"] in citations]
             kind = run.get("research_kind") or self.infer_kind()
             run["research_kind"] = kind
+            reviewed = [source_assessment.current(self, source["id"]) for source in run["sources"]
+                        if source["id"] in citations]
+            supportive = [review for review in reviewed if review and review["verdict"] == "supports"]
             substantive = any(asset["id"] in citations for asset in run.get("assets", [])) or any(
                 document.get("asset_id") in citations for document in run.get("documents", [])) or any(
-                source["id"] in citations
-                and ("正文" in str(source.get("evidence_scope") or "") or
-                     "网页搜索摘要" in str(source.get("evidence_scope") or ""))
-                and str(source.get("content") or source.get("text") or source.get("abstract") or "").strip()
-                for source in run["sources"])
+                supportive)
             report = {"conclusion": str(args.get("conclusion", "")), "citations": citations,
                       "lesson": str(args.get("lesson", ""))}
             manuscript = reporting.validate_manuscript(args.get("manuscript"), citations)
@@ -1185,12 +1223,15 @@ class ResearchEngine:
                 report["manuscript"] = manuscript
 
             if kind in ("qualitative", "literature", "mixed"):
-                if substantive:
-                    report["evidence_scope_note"] = "定性/文献类结论只依据本轮检索到的摘要或正文；未获取平台数据时不做外推。"
+                if substantive or (kind == "mixed" and verified):
+                    report["evidence_scope_note"] = "来源评估的适用范围与局限：" + "；".join(
+                        f"{review['source_id']}：{review['limitation']}" for review in supportive[:6]) if supportive else (
+                        "本轮仅有用户材料或已复核的本地实验；不得外推未核实的真实世界效果。")
                     run["status"] = "completed"
                 else:
-                    report["evidence_gaps"] = ["检索仅返回元数据或摘要级线索",
-                                               "缺少可直接归因于研究对象的正文、平台或受众数据"]
+                    report["evidence_gaps"] = [
+                        "本轮引用来源尚无针对当前问题且附有原文引句的支持性评估",
+                        *[f"{review['source_id']}：{review['limitation']}" for review in reviewed if review][:3]]
                     run["status"] = "inconclusive"
             else:
                 run["status"] = "completed" if verified else "incomplete"
@@ -1333,7 +1374,8 @@ def create(body):
            "mode": "agent", "model": model, "created_at": storage.now(), "status": "queued",
            "budget_enabled": budget_enabled, "token_limit": tokens, "seconds_limit": seconds,
            "max_steps": steps, "seed": int(body.get("seed", 42)),
-           "assets": prepared, "sources": [], "hypotheses": [], "experiments": [], "steps": [], "events": [], "calls": [],
+           "assets": prepared, "sources": [], "source_assessments": [],
+           "hypotheses": [], "experiments": [], "steps": [], "events": [], "calls": [],
            "experience": experience, "memory_version": experience["version"] if experience else 0,
            "memory_context": context, "memory_mode": "auto" if body.get("use_memory", True) else "disabled",
            "model_source": source, "provider": provider, "cloud_enabled": source == "cloud",

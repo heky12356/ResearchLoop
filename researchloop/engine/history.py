@@ -87,7 +87,7 @@ def fork(run, folder, node_id, question=""):
             raise ValueError('缺少初始输入的冻结快照，无法精确回退')
         state=copy.deepcopy(saved['state'])
         artifacts=[a for a in saved['artifacts'] if Path(a['path']).parts[0] in ('inputs','source')]
-        state.update(sources=[],hypotheses=[],experiments=[],documents=[],steps=[],calls=[],events=[],trace=[],
+        state.update(sources=[],source_assessments=[],hypotheses=[],experiments=[],documents=[],steps=[],calls=[],events=[],trace=[],
                      agents=[],active_agent=None,workflow=None,plan=None,reflections=[],evidence_collected=False,
                      subagents=[],delegation_batches=[],approval_requests=[],permission_grants=[])
         for key in ('report','pending_response','pending_decision','pending_tool_retry','gap_fill','decision_feedback','recovery_feedback'):
@@ -120,7 +120,7 @@ def fork(run, folder, node_id, question=""):
         state["branch_context"] = [{k: item.get(k) for k in ("id", "tool", "reason", "args", "observation")}
                                    for item in records[:index + 1]] if index is not None else [
                                        {"model_request": legacy_call.get("request"), "model_response": legacy_call.get("response")}]
-        state.update(sources=[], hypotheses=[], experiments=[], documents=[], steps=[], calls=[], events=[], trace=[],
+        state.update(sources=[], source_assessments=[], hypotheses=[], experiments=[], documents=[], steps=[], calls=[], events=[], trace=[],
                      agents=[], active_agent=None, workflow=None, plan=None, reflections=[], evidence_collected=False)
         selected_turn = records[index].get("turn") if index is not None else legacy_call.get("turn")
         question_at_node = next((turn.get("question") for turn in run.get("turns", []) if turn.get("id") == selected_turn), run["question"])

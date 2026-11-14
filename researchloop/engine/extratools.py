@@ -88,8 +88,8 @@ def remember_fact(engine, args):
     ids = args.get("evidence_ids")
     allowed = set(engine.memory_evidence_ids())
     if not isinstance(ids, list) or not ids or any(identifier not in allowed for identifier in ids):
-        raise ValueError("研究事实记忆必须绑定已有材料、含正文或摘要的来源或已复核实验的 evidence_ids；"
-                         "只有元数据的来源和未核实判断不能写成事实。偏好可在记忆页面添加。")
+        raise ValueError("研究事实记忆必须绑定已有材料、针对本题评估为支持的来源或已复核实验的 evidence_ids；"
+                         "未评估或仅作背景的来源不能写成事实。偏好可在记忆页面添加。")
     if str(args.get("predicate") or "").strip().casefold() in RESERVED_PREDICATES:
         raise ValueError("该谓词保留给用户在记忆页面添加的偏好、备注或方法经验，研究事实请使用描述关系的谓词")
     pending = {"predicate": str(args.get("predicate") or ""), "object": str(args.get("object") or ""),

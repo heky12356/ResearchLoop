@@ -209,6 +209,8 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(db.facts(scope='research'), [])
         engine.run['sources'] = [{'id':'p1','title':'测试来源','evidence_scope':'网页正文',
                                   'content':'测试网页正文支持有限的观察。'}]
+        engine.apply('assess_source', {'source_id':'p1','verdict':'supports','quote':'测试网页正文支持有限的观察。',
+                     'claim':'仅支持该测试观察','reason':'引句来自正文','limitation':'仅有这一来源'})
         pending = engine.apply('remember_fact',{'predicate':'observation','object':'test','summary':'有来源的测试观察','evidence_ids':['p1']})
         self.assertEqual(pending['status'], 'pending_report')
         self.assertEqual(db.facts(scope='research'), [])

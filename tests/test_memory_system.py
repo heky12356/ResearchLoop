@@ -64,6 +64,8 @@ class MemorySystemTests(unittest.TestCase):
         engine.run['research_kind'] = 'qualitative'
         engine.run['sources'] = [{'id':'p1','title':'测试来源','abstract':'测试使用的网页证据',
                                  'evidence_scope':'网页搜索摘要（测试），不是同行评议'}]
+        engine.apply('assess_source', {'source_id':'p1','verdict':'supports','quote':'测试使用的网页证据',
+                     'claim':'仅支持测试判断','reason':'引句来自已存摘要','limitation':'仅为测试摘录'})
         engine.decide = lambda: {'tool':'finish','args':{'conclusion':'结论仅限于该测试来源，不作任何范围外推。',
                     'citations':['p1'],'lesson':'定性判断需要逐条标明来源范围'}}
         run = engine.execute()

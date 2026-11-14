@@ -24,6 +24,13 @@ class ResearchEngineTests(unittest.TestCase):
     def engine(self, question="研究随机采样的均值误差是否在合理范围内", **kwargs):
         return core.create({"question": question, "max_steps": 10, **kwargs})
 
+    def review(self, engine, source_id, quote, verdict="supports"):
+        return engine.apply("assess_source", {
+            "source_id": source_id, "verdict": verdict, "quote": quote,
+            "claim": "该引句只能支持本题中的有限判断",
+            "reason": "根据保存的原文判断其与当前问题的关系",
+            "limitation": "不能从这条资料推断未呈现的结果"})
+
     def actions(self, *, threshold=0.5, broken=False):
         rows = [{"tool": "inspect", "args": {}},
                 {"tool": "hypothesis", "args": {"statement": "随机均值的绝对误差小于0.5", "prediction": "误差较小", "controls": "标准正态分布，相同样本量", "metric": "error", "relation": "lt", "threshold": threshold}}]
@@ -220,6 +227,7 @@ class ResearchEngineTests(unittest.TestCase):
         engine.run["sources"] = [{"id": "p1", "title": "媒体报道", "url": "https://news.example.com/a",
                                   "abstract": "奶龙相关内容", "evidence_scope":
                                   "网页搜索摘要（tavily），媒体/平台内容，不是同行评议"}]
+        self.review(engine, "p1", "奶龙相关内容")
         result = engine.apply("finish", {"conclusion": "依据本轮网页证据只能说明平台存在相关报道，不推断传播效果。",
                                          "citations": ["p1"], "lesson": "定性问题需要平台证据"})
         self.assertEqual(result["status"], "completed")
@@ -277,14 +285,78 @@ class ResearchEngineTests(unittest.TestCase):
 
     def test_kind_is_inferred_for_web_evidence_without_plan(self):
         engine = self.engine()
-        engine.run["sources"] = [{"id": "p1", "title": "报道", "url": "https://news.example.com/a",
+        engine.run["sources"] = [{"id": "p1", "title": "公开报道存在", "url": "https://news.example.com/a",
                                   "abstract": "内容", "evidence_scope":
                                   "网页搜索摘要（tavily），媒体/平台内容，不是同行评议"}]
+        self.review(engine, "p1", "公开报道存在")
         engine.run["plan"] = None
         result = engine.apply("finish", {"conclusion": "依据本轮网页证据只能说明存在公开报道，不推断传播效果。",
                                          "citations": ["p1"], "lesson": ""})
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(engine.run["research_kind"], "mixed")
+        self.assertEqual(engine.run["research_kind"], "literature")
+
+    def test_source_review_selects_by_question_and_checks_original_quote(self):
+        engine = self.engine(question="核查某篇论文的标题是否存在")
+        engine.run["research_kind"] = "literature"
+        engine.run["sources"] = [{"id": "p1", "title": "论文标题确实存在", "abstract": "",
+                                  "evidence_scope": "只有元数据，不是结论证据"}]
+        with self.assertRaisesRegex(ValueError, "逐字引用"):
+            self.review(engine, "p1", "未见过的论文结果")
+        review = self.review(engine, "p1", "论文标题确实存在")
+        self.assertEqual(review["basis"], "title")
+        result = engine.apply("finish", {"conclusion": "该来源只证明检索记录中存在这一论文标题。",
+                                          "citations": ["p1"], "lesson": ""})
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("p1", engine.run["report"]["evidence_scope_note"])
+
+    def test_rejected_or_stale_source_review_cannot_complete_report(self):
+        engine = self.engine(question="核查资料是否支持当前关系")
+        engine.run["research_kind"] = "qualitative"
+        engine.run["sources"] = [{"id": "p1", "title": "来源", "abstract": "只有背景内容。"}]
+        self.review(engine, "p1", "只有背景内容。", verdict="context")
+        result = engine.apply("finish", {"conclusion": "当前资料只提供背景，未能确认所问关系。",
+                                          "citations": ["p1"], "lesson": ""})
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertNotIn("p1", engine.memory_evidence_ids())
+
+        engine.run["sources"][0]["abstract"] = "内容已更新，仍需重新核对。"
+        self.assertIsNone(core.source_assessment.current(engine, "p1"))
+        self.review(engine, "p1", "内容已更新，仍需重新核对。")
+        engine.run["current_question"] = "另一个问题需要独立判断来源的适用性"
+        self.assertIsNone(core.source_assessment.current(engine, "p1"))
+
+    def test_unreviewed_source_does_not_complete_even_with_citation(self):
+        engine = self.engine()
+        engine.run["research_kind"] = "qualitative"
+        engine.run["sources"] = [{"id": "p1", "title": "相关标题", "content": "这篇正文有文字。"}]
+        result = engine.apply("finish", {"conclusion": "目前不能从未经评估的材料确认结论。",
+                                          "citations": ["p1"], "lesson": ""})
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertIn("assess_source", engine.available_tools())
+
+    def test_assessment_tool_exposes_actual_source_and_reporter_can_use_it(self):
+        engine = self.engine(workflow_mode="plan")
+        engine.run["workflow"] = {"stages": []}
+        engine.run["sources"] = [{"id": "p1", "title": "测试标题", "abstract": "实际摘录支持有限判断。"}]
+        engine.run["active_agent"] = {"id": "g2", "role": "reporter", "tools": ["finish", "assess_source"]}
+        self.assertEqual(engine.available_tools(), ["assess_source", "finish"])
+        catalog = engine.tool_catalog(["assess_source"])[0]
+        self.assertEqual(catalog["args_schema"]["properties"]["source_id"]["enum"], ["p1"])
+        captured = {}
+
+        def complete(system, prompt, schema, **kwargs):
+            captured.update(prompt)
+            return {"tool": "assess_source", "reason": "核对摘录", "args": {
+                "source_id": "p1", "verdict": "supports", "quote": "实际摘录支持有限判断。",
+                "claim": "有限判断", "reason": "摘录直接出现", "limitation": "仅有摘要"}}, {"source": "fixture"}
+
+        engine.complete = complete
+        decision = engine.agent_step()
+        self.assertEqual(decision["tool"], "assess_source")
+        self.assertIn("实际摘录支持有限判断。", captured["source_candidates"][0]["excerpt"])
+        engine.apply(decision["tool"], decision["args"])
+        self.assertEqual(engine.available_tools(), ["finish"])
+        self.assertEqual(engine.memory_evidence_ids(), ["p1"])
 
     def test_unfinished_evidence_run_ends_with_a_gap_report(self):
         engine = self.engine(max_steps=1)
@@ -309,6 +381,11 @@ class ResearchEngineTests(unittest.TestCase):
             seen.append((engine.run["active_agent"]["role"], choices))
             if engine.run["active_agent"]["role"] == "planner":
                 return {"tool": "web_fetch", "args": {"url": "https://example.org/subject"}}
+            if not engine.run["source_assessments"]:
+                return {"tool": "assess_source", "args": {
+                    "source_id": "p1", "verdict": "supports", "quote": "测试正文说明两个名称之间的关系。",
+                    "claim": "只支持该页面所述关系", "reason": "页面正文直接表述该关系",
+                    "limitation": "仅有这一个网页"}}
             return {"tool": "finish", "args": {
                 "conclusion": "测试网页正文仅支持有限的定性判断。", "citations": ["p1"], "lesson": ""}}
 
@@ -321,7 +398,7 @@ class ResearchEngineTests(unittest.TestCase):
                 patch("researchloop.webaccess.fetch", return_value=page):
             run = engine.execute()
         self.assertEqual(run["status"], "completed")
-        self.assertEqual([step["tool"] for step in run["steps"]], ["web_fetch", "finish"])
+        self.assertEqual([step["tool"] for step in run["steps"]], ["web_fetch", "assess_source", "finish"])
         self.assertEqual(seen[-1], ("reporter", ["finish"]))
         self.assertEqual(run["report"]["citations"], ["p1"])
         self.assertIn("测试正文", run["steps"][0]["observation"]["content"])
@@ -452,12 +529,81 @@ class ResearchEngineTests(unittest.TestCase):
         engine.run["research_kind"] = "literature"
         engine.run["sources"] = [{"id": "p1", "title": "测试正文", "url": "https://example.org/a",
                                   "evidence_scope": "网页正文", "text": "测试正文支持有限比较。"}]
+        self.review(engine, "p1", "测试正文支持有限比较。")
         engine.decide = lambda: {"tool": "finish", "args": {
             "conclusion": "测试正文只支持有限的定性比较。", "citations": ["p1"], "lesson": ""}}
         run = engine.execute()
         self.assertEqual(run["status"], "completed")
         self.assertEqual([step["tool"] for step in run["steps"]], ["finish"])
         self.assertEqual([agent["status"] for agent in run["agents"]], ["skipped", "skipped", "completed"])
+
+    def test_planned_local_experiment_can_start_without_retrieval(self):
+        engine = self.engine(workflow_mode="plan", use_memory=False, max_steps=10)
+        engine.run["workflow"] = {"source": "fixture", "stages": workflow.validate([
+            {"role": "experimenter", "goal": "设计并运行本地模拟", "why": "可计算的数值问题",
+             "max_steps": 2, "tools": ["experiment"]},
+            {"role": "verifier", "goal": "独立重跑", "why": "检查实测结果", "max_steps": 1},
+            {"role": "reporter", "goal": "报告结论", "why": "说明适用边界", "max_steps": 1},
+        ])}
+        decisions = iter([
+            {"tool": "plan", "args": {"feasible": True, "method": "模拟标准正态分布的样本均值",
+                                     "limitations": "只适用于设定的分布", "literature_query": "",
+                                     "research_kind": "simulation"}},
+            {"tool": "hypothesis", "args": {"statement": "样本均值误差小于0.5",
+                                            "prediction": "误差较小", "controls": "固定样本量与分布",
+                                            "metric": "error", "relation": "lt", "threshold": 0.5}},
+            {"tool": "experiment", "args": {"hypothesis_id": "h1", "code":
+                "values = rng.normal(size=200)\nemit_result({'metrics': {'error': float(abs(np.mean(values)))}})"}},
+            {"tool": "verify", "args": {"experiment_id": "x1"}},
+            {"tool": "finish", "args": {"conclusion": "本轮模拟的均值误差已独立复核，结论只适用于该模拟机制。",
+                                      "citations": ["h1", "x1"], "lesson": "保留冻结代码与复核记录"}},
+        ])
+        offered = []
+
+        def decide():
+            offered.append(engine.available_tools())
+            return next(decisions)
+
+        engine.decide = decide
+        run = engine.execute()
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual([step["tool"] for step in run["steps"]],
+                         ["plan", "hypothesis", "experiment", "verify", "finish"])
+        self.assertEqual(run["sources"], [])
+        self.assertFalse(run.get("evidence_collected"))
+        self.assertIn("plan", offered[0])
+        self.assertIn("hypothesis", offered[1])
+        self.assertTrue(run["experiments"][0]["verification"])
+
+    def test_mixed_report_accepts_verified_local_experiment(self):
+        engine = self.engine()
+        engine.apply("plan", {"feasible": True, "method": "本地模拟并说明边界",
+                              "limitations": "尚无外部数据", "literature_query": "",
+                              "research_kind": "mixed"})
+        engine.run["experiments"] = [{"id": "x1", "hypothesis_id": "h1", "status": "completed",
+                                      "verification": {"check": {"passed": False}}}]
+        result = engine.apply("finish", {
+            "conclusion": "当前只完成本地实验的独立复核，没有外部事实结论。",
+            "citations": ["x1"], "lesson": "须进一步寻找真实数据"})
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("本地实验", engine.run["report"]["evidence_scope_note"])
+
+    def test_legacy_simulation_protocol_does_not_require_literature(self):
+        engine = self.engine()
+        engine.run["evidence_collected"] = True
+        engine.apply("plan", {"feasible": True, "method": "本地模拟", "limitations": "模拟边界",
+                              "literature_query": "optional", "research_kind": "simulation"})
+        config = storage.settings()
+        with patch("researchloop.storage.settings",
+                   return_value={**config, "web": {**config["web"], "enabled": True}}):
+            self.assertEqual(engine.next_protocol_action()[0], "hypothesis")
+
+    def test_research_kind_inference_uses_records_not_source_scope_labels(self):
+        engine = self.engine()
+        engine.run["sources"] = [{"id": "p1", "title": "网页正文", "evidence_scope": "网页正文"}]
+        self.assertEqual(engine.infer_kind(), "literature")
+        engine.run["experiments"] = [{"id": "x1", "status": "completed"}]
+        self.assertEqual(engine.infer_kind(), "mixed")
 
     def test_primary_planner_prompt_excludes_unneeded_experiment(self):
         engine = self.engine(workflow_mode="plan", use_memory=False)
@@ -670,6 +816,7 @@ class ResearchEngineTests(unittest.TestCase):
         fact = {"predicate": "测试关系", "object": "对象", "summary": "摘要支持的有限结论"}
         with self.assertRaises(ValueError):
             engine.apply("remember_fact", {**fact, "evidence_ids": ["p1"]})
+        self.review(engine, "p2", "摘要内容")
         for predicate in ("user_preference", " User_Note ", "method_lesson"):
             with self.assertRaises(ValueError):
                 engine.apply("remember_fact", {**fact, "predicate": predicate, "evidence_ids": ["p2"]})
@@ -749,6 +896,7 @@ class ResearchEngineTests(unittest.TestCase):
         engine.run["research_kind"] = "qualitative"
         engine.run["sources"] = [{"id": "p1", "title": "测试正文", "evidence_scope": "网页正文",
                                   "abstract": "测试事实", "url": "https://example.org/a"}]
+        self.review(engine, "p1", "测试事实")
         args = {"predicate": "测试关系", "object": "有限事实", "summary": "仅由测试正文支持",
                 "evidence_ids": ["p1"]}
         with patch("researchloop.engine.extratools.facts.remember") as remember:
@@ -761,6 +909,7 @@ class ResearchEngineTests(unittest.TestCase):
         other = self.engine()
         other.run["research_kind"] = "qualitative"
         other.run["sources"] = engine.run["sources"].copy()
+        self.review(other, "p1", "测试事实")
         with patch("researchloop.engine.extratools.facts.remember") as remember:
             other.apply("remember_fact", args)
             other.apply("finish", {"conclusion": "报告没有引用该测试事实。", "citations": [], "lesson": ""})
@@ -770,6 +919,7 @@ class ResearchEngineTests(unittest.TestCase):
         engine = self.engine(max_steps=1)
         engine.run["sources"] = [{"id": "p1", "title": "测试来源", "url": "https://example.org/a",
                                   "abstract": "测试内容", "evidence_scope": "网页正文"}]
+        self.review(engine, "p1", "测试内容")
         engine.apply("remember_fact", {"predicate": "测试事实", "object": "候选说法",
                                         "summary": "尚未进入完成报告", "evidence_ids": ["p1"]})
         engine.decide = lambda: {"tool": "read_file", "args": {"path": "example.org/missing"}}

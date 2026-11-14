@@ -34,7 +34,8 @@ MAX_STAGE_STEPS = 12
 ROLE_ALIASES = {"规划": "planner", "计划": "planner", "实验": "experimenter", "复核": "verifier",
                 "验证": "verifier", "报告": "reporter", "撰写": "reporter",
                 "planner": "planner", "experimenter": "experimenter", "verifier": "verifier", "reporter": "reporter"}
-STAGE_ESSENTIALS = {"experimenter": ["hypothesis", "experiment", "command_experiment"], "verifier": ["verify"]}
+STAGE_ESSENTIALS = {"experimenter": ["plan", "hypothesis", "experiment", "command_experiment"],
+                    "verifier": ["verify"], "reporter": ["assess_source"]}
 
 
 def stage_tools(role, tools):
@@ -51,8 +52,8 @@ def role_tools():
 
 def default_stages():
     return [
-        {"role": "planner", "goal": "检查材料与文献，确认问题所需证据及研究方法", "max_steps": 4,
-         "why": "先确认证据与数据是否足以回答，避免以模拟替代真实材料"},
+        {"role": "planner", "goal": "判断问题所需证据及研究方法", "max_steps": 4,
+         "why": "判断外部取证或本地实验是否足以回答，限定模拟的适用范围"},
         {"role": "generalist", "goal": "根据问题继续取证；需要实验时注册假设、执行并复核", "max_steps": 6,
          "why": "定性问题核查来源，定量问题检验预注册判据"},
         {"role": "reporter", "goal": "依据复核结果形成结论、局限与方法经验", "max_steps": 2,
@@ -150,8 +151,8 @@ def plan(engine):
               "model_profiles": (run.get('routing') or {}).get('profiles',{}),
               "instruction": "只输出stages数组：阶段数量与划分由这个问题本身决定（1–8个），不要套用固定的四阶段模板。"
                              "每个阶段给出role、goal、max_steps；可以为阶段取自定义名称（role填自定义名，会作为通用阶段执行），"
-                             "也可以用 tools 限定该阶段只使用哪些工具。先判断问题所需证据：定性、文献、概念比较等无需可执行数值检验的问题，应只安排取证、分析和报告，不安排experimenter/verifier；不要为凑阶段而用模拟代替真实文献。"
-                             "只有存在可执行的数值问题、明确指标及可检验假设时才安排experimenter，随后安排verifier与reporter；若假设尚未注册，实验阶段必须允许hypothesis工具先注册，不能直接finish。"
+                             "也可以用 tools 限定该阶段只使用哪些工具。先判断问题所需证据：定性、文献、概念比较等无需可执行数值检验的问题，应安排取证、分析和报告；不要为凑阶段而用模拟代替真实文献。"
+                             "可由本地计算或模拟检验的问题，无须先找外部资料：安排experimenter、verifier与reporter；实验阶段可先plan制定方法，再hypothesis注册可证伪判据。真实世界效果仍需真实数据，模拟结论只适用于所设机制。"
                              "即使取证失败，也应继续可行的取证步骤，最后交给reporter总结已尝试来源和证据缺口。"
                              "每个阶段必须写 why：为什么需要、解决什么、为什么这个顺序。可用 model_tier 选择已配置的 light/strong，auto 沿用默认路由。"
                              "tools 是可选的角色工具子集；留空数组表示不限制。报告阶段须使用 reporter 且保留 finish，不能用 inspect。"

@@ -63,15 +63,46 @@ class ReportingTests(unittest.TestCase):
         self.assertIn(paper['methods'], md)
         self.assertNotIn('## Agent分析', md)
 
-    def test_invented_inline_citation_is_rejected_before_completion(self):
+    def test_invented_inline_citation_is_warned_and_not_counted_as_evidence(self):
         paper = manuscript()
         paper['results'] = '不存在的来源不能支持这句话。[p999]'
-        before = self.engine.run['status']
-        with self.assertRaisesRegex(ValueError, 'p999'):
-            self.engine.apply('finish', {'conclusion': '必须核查实际引用，不能凭空完成。', 'citations': ['p1'],
-                                         'lesson': '', 'manuscript': paper})
-        self.assertEqual(self.engine.run['status'], before)
-        self.assertNotIn('report', self.engine.run)
+        result = self.engine.apply('finish', {'conclusion': '本轮只有测试来源可核查。',
+                                               'citations': ['p1'], 'lesson': '', 'manuscript': paper})
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(self.engine.run['report']['citations'], ['p1'])
+        self.assertIn('p999', str(result['warnings']))
+        doc = reporting.document(self.engine.run)
+        self.assertIn('p999', reporting.markdown(doc))
+        self.assertIn('p999', reporting.latex(doc))
+        self.assertTrue(reporting.pdf(doc).startswith(b'%PDF-'))
+
+    def test_missing_real_inline_citation_is_added_with_warning_in_one_report_step(self):
+        self.engine.run['sources'].append({'id': 'p2', 'title': '另一条真实来源',
+                                            'abstract': '背景信息'})
+        paper = manuscript()
+        paper['introduction'] += ' 背景参考。[p2]'
+        self.engine.run['workflow_mode'] = 'plan'
+        self.engine.run['workflow'] = {'stages': [{
+            'role': 'reporter', 'goal': '形成报告', 'max_steps': 1}]}
+        self.engine.decide = lambda: {'tool': 'finish', 'args': {
+            'conclusion': '现有资料只支持有限的测试结论。', 'citations': ['p1'],
+            'lesson': '', 'manuscript': paper}}
+        run = self.engine.execute()
+        self.assertEqual(run['status'], 'completed')
+        self.assertEqual([step['tool'] for step in run['steps']], ['finish'])
+        self.assertEqual(run['report']['citations'], ['p1', 'p2'])
+        self.assertIn('补入 citations', str(run['report']['warnings']))
+        self.assertIn('报告检查提醒', (self.engine.folder/'report.md').read_text(encoding='utf-8'))
+        self.assertEqual(run['turns'][-1]['report']['warnings'], run['report']['warnings'])
+
+    def test_partial_manuscript_falls_back_to_saved_result_with_warning(self):
+        result = self.engine.apply('finish', {'conclusion': '本轮仅确认测试来源的有限陈述。',
+                                               'citations': ['p1'], 'lesson': '',
+                                               'manuscript': {'title': '部分报告', 'results': '仅有局部结果。[p1]'}})
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(self.engine.run['report']['manuscript']['results'], '仅有局部结果。[p1]')
+        self.assertIn('缺少或无法使用', str(result['warnings']))
+        self.assertIn('本轮仅确认测试来源', str(reporting.document(self.engine.run)['sections']))
 
     def test_final_prompt_includes_content_and_actual_measurements(self):
         action = {'tool': 'finish', 'reason': '按证据收尾', 'args': {'conclusion': '只报告测试来源所支持的有限陈述。',

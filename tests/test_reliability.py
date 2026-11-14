@@ -137,30 +137,43 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual([s['tool'] for s in result['steps']], ['web_search','web_search','finish'])
         self.assertEqual(result['steps'][1]['attempt'], 2)
 
-    def test_final_report_validation_gets_one_repair_before_stage_ends(self):
+    def test_final_report_invalid_reference_is_warned_without_retry(self):
         engine = self.engine(workflow_mode='plan')
         engine.run['workflow'] = {'stages':[{'role':'reporter','goal':'如实收尾','max_steps':1}]}
-        actions = iter([{'tool':'finish','args':{'conclusion':'仅有记忆而没有可引用的研究证据。','citations':['memory:3'],'lesson':''}},
-                        {'tool':'finish','args':{'conclusion':'本轮未取得外部证据，问题的前提和出处尚未核实。','citations':[],'lesson':''}}])
-        engine.decide = lambda: next(actions)
+        engine.decide = lambda: {'tool':'finish','args':{
+            'conclusion':'仅有记忆而没有可引用的研究证据。','citations':['memory:3'],'lesson':''}}
         result = engine.execute()
-        self.assertEqual(len(result['steps']), 2)
+        self.assertEqual(len(result['steps']), 1)
         self.assertEqual(result['status'], 'incomplete')
         self.assertEqual(result['report']['citations'], [])
-        self.assertTrue(result.get('draft_report'))
-        self.assertEqual(result['recovery_extensions']['t1:g1'], 1)
+        self.assertIn('memory:3', str(result['report']['warnings']))
+        self.assertNotIn('t1:g1', result.get('recovery_extensions', {}))
 
-    def test_exhausted_recovery_keeps_invalid_draft_separate_from_report(self):
+    def test_malformed_final_tool_args_get_one_repair_step(self):
+        engine = self.engine(workflow_mode='plan')
+        engine.run['workflow'] = {'stages':[{'role':'reporter','goal':'如实收尾','max_steps':1}]}
+        actions = iter([{'tool':'finish','args':None},
+                        {'tool':'finish','args':{'conclusion':'本轮没有可核验的结论。',
+                                                  'citations':[],'lesson':''}}])
+        engine.decide = lambda: next(actions)
+        result = engine.execute()
+        self.assertEqual([step['status'] for step in result['steps']], ['failed', 'completed'])
+        self.assertEqual(result['recovery_extensions']['t1:g1'], 1)
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['report']['citations'], [])
+
+    def test_invalid_reference_without_evidence_saves_incomplete_report(self):
         engine = self.engine(max_steps=1)
         engine.decide = lambda: {'tool':'finish','args':{'conclusion':'该断言没有可引用的研究证据。','citations':['memory:3'],'lesson':'不可验证'}}
         result = engine.execute()
         self.assertEqual(result['report']['citations'], [])
-        self.assertIn('记忆不是证据', result['report']['conclusion'])
-        self.assertFalse(result['draft_report']['verified'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('该断言没有', result['report']['conclusion'])
+        self.assertIn('memory:3', str(result['report']['warnings']))
+        self.assertFalse(result.get('draft_report'))
         self.assertEqual(memory.state()['methods']['versions'], [])
-        # A rejected finish is a failed operation, not a completed turn boundary.
         state, _ = history.fork(result, engine.folder, result['trace'][-1]['id'])
-        self.assertEqual(len(state['turns']), 1)
+        self.assertEqual(len(state['turns']), 2)
 
     def test_observed_question_falls_back_and_reports_unverified_premise(self):
         engine = self.engine(workflow_mode='plan')
@@ -174,32 +187,34 @@ class ReliabilityTests(unittest.TestCase):
                     return {'tool':'platform_search','args':{'platform':'zhihu','query':engine.question_text(),'reason':'核实出处'}}
                 self.assertNotIn('web_search',engine.available_tools())
                 return {'tool':'literature','args':{'query':'question premise'}}
-            if not engine.run.get('draft_report'):
-                return {'tool':'finish','args':{'conclusion':'未取得可用于核验的来源，不能确定这个提问的具体语境。','citations':['memory:3'],'lesson':''}}
-            return {'tool':'finish','args':{'conclusion':'原搜索服务鉴权失败，备用来源未取得证据，问题前提和出处尚未核实。','citations':[],'lesson':''}}
+            return {'tool':'finish','args':{'conclusion':'未取得可用于核验的来源，具体语境尚未核实。','citations':['memory:3'],'lesson':''}}
         engine.decide=decide
         with patch('researchloop.webaccess._search',side_effect=self.error(401)) as search, patch('researchloop.engine.tools.literature',return_value=[]) as papers:
             result=engine.execute()
         self.assertEqual(search.call_count,1)
         self.assertEqual(papers.call_count,1)
-        self.assertEqual([s['tool'] for s in result['steps']],['platform_search','literature','finish','finish'])
+        self.assertEqual([s['tool'] for s in result['steps']],['platform_search','literature','finish'])
         self.assertEqual(result['status'],'incomplete')
         self.assertIn('尚未核实',result['report']['conclusion'])
+        self.assertIn('memory:3', str(result['report']['warnings']))
         self.assertEqual(result['calls'],[])
         self.assertEqual(db.facts(scope='research'),[])
 
-    def test_model_schema_repairs_nonexistent_citation_without_executing_invalid_finish(self):
+    def test_model_decision_keeps_unknown_citation_for_report_warning(self):
         engine = self.engine()
-        actions = iter([{'tool':'finish','reason':'错误引用','args':{'conclusion':'没有来源的暂定判断，不应作为结论。','citations':['remember_fact:3'],'lesson':''}},
-                        {'tool':'finish','reason':'修正引用','args':{'conclusion':'没有证据，问题前提尚未核实，当前未完成。','citations':[],'lesson':''}}])
+        action = {'tool':'finish','reason':'报告缺口','args':{
+            'conclusion':'没有来源的暂定判断，不应作为结论。','citations':['remember_fact:3'],'lesson':''}}
         def respond(*args, **kwargs):
-            return io.BytesIO(json.dumps({'message':{'content':json.dumps(next(actions))},'prompt_eval_count':40,'eval_count':20}).encode())
+            return io.BytesIO(json.dumps({'message':{'content':json.dumps(action)},'prompt_eval_count':40,'eval_count':20}).encode())
         with patch('urllib.request.urlopen', side_effect=respond):
             decision = engine.agent_step()
-        self.assertEqual(decision['args']['citations'], [])
-        self.assertEqual(engine.budget.used, 120)
-        self.assertEqual(len(engine.run['calls']), 2)
+        self.assertEqual(decision['args']['citations'], ['remember_fact:3'])
+        self.assertEqual(engine.budget.used, 60)
+        self.assertEqual(len(engine.run['calls']), 1)
         self.assertEqual(engine.run['steps'], [])
+        result = engine.apply('finish', decision['args'])
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('remember_fact:3', str(result['warnings']))
 
     def test_unverified_claim_cannot_be_promoted_into_fact_memory(self):
         engine = self.engine()

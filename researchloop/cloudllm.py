@@ -15,6 +15,10 @@ from . import llmjson
 JSON_OBJECT = {"response_format": {"type": "json_object"}}
 
 
+class TruncatedCompletionError(RuntimeError):
+    """The provider exhausted its output limit before returning a complete answer."""
+
+
 def normalise(base_url):
     value = str(base_url or "").strip().rstrip("/")
     parsed = urllib.parse.urlparse(value)
@@ -55,7 +59,7 @@ class Cloud:
         self.budget = budget
         self.on_call = on_call
 
-    def call(self, system, prompt, schema, purpose, seed=None, max_output=1500, reserve=None):
+    def call(self, system, prompt, schema, purpose, seed=None, max_output=4096, reserve=None):
         reserve = reserve or 6144 + max_output
         self.budget.reserve(reserve)
         body = {"model": self.model, "temperature": 0, "stream": False,
@@ -86,12 +90,18 @@ class Cloud:
                         cached_tokens=int(cached or 0), context_tokens=usage["prompt_tokens"],
                         cloud_cost=None, status="ok")
             item["response"] = result
-            content = ((result.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+            choice = (result.get("choices") or [{}])[0]
+            if choice.get("finish_reason") == "length":
+                raise TruncatedCompletionError(
+                    "云端模型输出达到长度上限（finish_reason=length），JSON 尚未完成；须重新生成完整的简短回答")
+            content = (choice.get("message") or {}).get("content", "")
             parsed = llmjson.parse(content)
         except Exception as exc:
             item.update(status="error", error=str(exc))
             if "input_tokens" not in item:
                 item["unknown_reserved"] = reserve
+            if isinstance(exc, TruncatedCompletionError):
+                raise
             raise RuntimeError(f"云端模型调用失败：{exc}") from exc
         finally:
             item["wall_seconds"] = round(time.perf_counter() - started, 3)

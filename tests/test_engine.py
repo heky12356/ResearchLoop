@@ -80,8 +80,11 @@ class ResearchEngineTests(unittest.TestCase):
 
     def test_unknown_evidence_and_unregistered_experiments_are_rejected(self):
         engine = self.engine()
-        with self.assertRaises(ValueError):
-            engine.apply("finish", {"citations": ["fabricated-paper"]})
+        result = engine.apply("finish", {"conclusion": "本轮没有可核验的证据。",
+                                          "citations": ["fabricated-paper"]})
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(engine.run["report"]["citations"], [])
+        self.assertIn("fabricated-paper", str(result["warnings"]))
         with self.assertRaises(ValueError):
             engine.apply("experiment", {"hypothesis_id": "missing", "code": "result = {}"})
 
@@ -841,13 +844,15 @@ class ResearchEngineTests(unittest.TestCase):
             engine.apply("platform_search", {"platform": "tieba", "query": "二次"})
         self.assertEqual(len(engine.run["sources"]), 2)
 
-    def test_manuscript_document_citation_must_be_listed(self):
+    def test_manuscript_document_citation_is_reconciled_with_real_evidence(self):
         from researchloop import reporting
         manuscript = {key: "内容" for key in reporting.FIELDS}
         manuscript["results"] = "文档正文支持该结论 [d1]。"
-        with self.assertRaises(ValueError):
-            reporting.validate_manuscript(manuscript, ["p1"])
-        self.assertTrue(reporting.validate_manuscript(manuscript, ["d1"]))
+        paper, warnings, added = reporting.review_manuscript(manuscript, ["p1"], {"p1", "d1"})
+        self.assertEqual(paper, manuscript)
+        self.assertEqual(added, ["d1"])
+        self.assertIn("补入 citations", warnings[0])
+        self.assertEqual(reporting.review_manuscript(manuscript, ["d1"], {"d1"}), (paper, [], []))
 
     def test_repeated_experimenter_finish_still_reaches_gap_report(self):
         engine = self.engine(workflow_mode="plan", use_memory=False)
@@ -949,9 +954,10 @@ class ResearchEngineTests(unittest.TestCase):
                               "literature_query": "", "research_kind": "qualitative"})
         self.assertNotIn(engine.run["status"], ("inconclusive", "completed", "incomplete"))
         self.assertTrue(engine.run["gap_fill"]["required"])
-        self.assertNotIn("finish", engine.available_tools())
-        with self.assertRaises(ValueError):
-            engine.apply("finish", {"conclusion": "证据不足，无法回答。", "citations": [], "lesson": ""})
+        self.assertIn("finish", engine.available_tools())
+        early = engine.apply("finish", {"conclusion": "证据不足，无法回答。", "citations": [], "lesson": ""})
+        self.assertEqual(early["status"], "inconclusive")
+        self.assertIn("证据缺口", str(early["warnings"]))
         engine.note_evidence_attempt("web_search", {"query": "奶龙"}, "completed")
         engine.note_evidence_attempt("web_search", {"query": "奶龙"}, "completed")  # duplicate marker
         self.assertEqual(engine.run["gap_fill"]["attempts"], 1)
@@ -1039,7 +1045,7 @@ class ResearchEngineTests(unittest.TestCase):
                "search_endpoint": "https://search.example.com/search", "search_api_key": ""}
         with patch("researchloop.storage.settings", return_value={**base, "web": web}):
             names = engine.available_tools()
-        self.assertNotIn("finish", names)
+        self.assertIn("finish", names)
         for tool in ("web_search", "platform_search", "literature"):
             self.assertIn(tool, names)
         allowed = engine.allowed_tools()

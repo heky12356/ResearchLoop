@@ -13,26 +13,40 @@ from pathlib import Path
 
 FIELDS = ("title", "abstract", "introduction", "methods", "results", "discussion", "conclusion")
 MANUSCRIPT_SCHEMA = {"type": "object", "properties": {key: {"type": "string"} for key in FIELDS},
-                     "required": list(FIELDS), "additionalProperties": False}
+                     "additionalProperties": True}
 WRITING_GUIDE = """收尾报告采用学术研究报告的行文方式，在 finish.manuscript 中提供 title、abstract、introduction、methods、results、discussion、conclusion。
 摘要概括问题、实际方法、主要发现和边界；引言说明问题与相关背景，未检索文献时如实说明；方法交代数据或模拟假设、实验设计与复核；结果解释实际观测；讨论分析机制、反例、偏差与局限；结论直接回答问题。
 借鉴 writing-cs-report：少用零碎小标题，正文用连贯段落展开因果与证据；不要把功能清单或执行日志当论文，不写空泛的“意义重大/综上所述”。不强凑字数、图表或个人经历。
-每项实质性论断用 [证据ID] 就近引用，ID 必须同时列入 citations；已复核实验可以作为本轮实测证据，无须附加外部文献。区分元数据、摘要、正文和实测；未做的实验、未获得的数值/出处不得补写，负结果照实分析，模拟不外推现实。
+每项实质性论断用 [证据ID] 就近引用，已复核实验可以作为本轮实测证据，无须附加外部文献。请核对 citations；正文漏列的真实证据会自动补入并提示，不存在的ID会标记为未核验。区分元数据、摘要、正文和实测；未做的实验、未获得的数值/出处不得补写，负结果照实分析，模拟不外推现实。
 同一URL的搜索摘要与抓取正文只算一个来源；按本题 assess_source 的引句、判断和局限选择材料，标题只支持标题本身能证明的事项。把直接支持结论的来源与仅用于交代背景的来源区分开，遇到相互矛盾的描述须说明差异。
 数据不足时按同样结构写简短的未完成研究报告，明确已尝试的方法、缺口和可继续步骤，不冒称完成。conclusion 参数保留简洁结论，lesson 仅写有条件的方法经验。
 字数服从剩余预算：优先准确的方法、结果与局限；正文使用纯文本段落，不在字符串内嵌套 Markdown 标题或 LaTeX 命令。"""
 
 
-def validate_manuscript(value, citations):
+def review_manuscript(value, citations, valid_ids):
     if value is None:
-        return None
-    from .engine.protocol import validate
-    validate(value, MANUSCRIPT_SCHEMA, "manuscript")
-    for text in value.values():
+        return None, [], []
+    if not isinstance(value, dict):
+        return None, ["报告正文格式不是对象，已使用现有结论和执行记录生成报告。"], []
+    warnings = []
+    paper = {key: value[key].strip() for key in FIELDS
+             if isinstance(value.get(key), str) and value[key].strip()}
+    missing = [key for key in FIELDS if key not in paper]
+    if missing:
+        warnings.append("结构化报告缺少或无法使用的段落：" + "、".join(missing) + "；导出时使用已有记录填补。")
+    added = []
+    for text in paper.values():
         for evidence_id in re.findall(r"\[([adphx]\d+)\]", text):
-            if evidence_id not in citations:
-                raise ValueError(f"正文引用 [{evidence_id}] 必须列入本次 citations，且属于已有证据")
-    return {key: value[key].strip() for key in FIELDS}
+            if evidence_id not in valid_ids:
+                warning = f"正文引用 [{evidence_id}] 不在本轮真实证据中，无法核验；该引用不计入证据。"
+            elif evidence_id not in citations and evidence_id not in added:
+                added.append(evidence_id)
+                warning = f"正文引用 [{evidence_id}] 已从本轮真实证据补入 citations。"
+            else:
+                continue
+            if warning not in warnings:
+                warnings.append(warning)
+    return paper or None, warnings, added
 
 
 def _number(value):
@@ -68,6 +82,7 @@ def document(run):
                          "满足判据" if verdict is True else "未满足判据" if verdict is False else "未复核"])
     discussion = paper.get("discussion") or plan.get("limitations") or "现有证据只支持本报告所述范围；未进行的实验、统计检验及外部验证不作推断。"
     gaps = report.get("evidence_gaps") or []
+    warnings = report.get("warnings") or []
     if gaps:
         discussion += "\n\n证据缺口：" + "；".join(gaps) + "。"
     if report.get("evidence_scope_note"):
@@ -118,11 +133,14 @@ def document(run):
             "sections": [("研究问题与背景", paper.get("introduction") or f"本研究围绕以下问题展开：{question}"),
                          ("研究方法", methods), ("研究结果", paper.get("results") or conclusion),
                          ("讨论与局限", discussion), ("结论", paper.get("conclusion") or conclusion)],
-            "measurements": rows, "references": references, "appendix": appendix, "id": run["id"]}
+            "measurements": rows, "references": references, "appendix": appendix,
+            "warnings": warnings, "id": run["id"]}
 
 
 def markdown(doc):
     parts = [f"# {doc['title']}", "## 摘要", doc["abstract"]]
+    if doc.get("warnings"):
+        parts += ["## 报告检查提醒", "\n".join("- " + warning for warning in doc["warnings"])]
     for index, (title, text) in enumerate(doc["sections"], 1):
         parts += [f"## {index}. {title}", text]
         if title == "研究结果" and doc["measurements"]:
@@ -151,6 +169,8 @@ def latex(doc):
              r"\setlength{\emergencystretch}{3em}", r"\title{" + esc(doc["title"]) + "}",
              r"\author{ResearchLoop}", r"\date{}", r"\begin{document}", r"\maketitle",
              r"\begin{abstract}", esc(doc["abstract"]), r"\end{abstract}"]
+    if doc.get("warnings"):
+        parts += [r"\section*{报告检查提醒}", *[esc(warning) + r"\par" for warning in doc["warnings"]]]
     for title, text in doc["sections"]:
         parts += [r"\section{" + esc(title) + "}", esc(text)]
         if title == "研究结果" and doc["measurements"]:
@@ -210,6 +230,10 @@ def pdf(doc):
         return [Paragraph(html.escape(part).replace("\n", "<br/>"), style)
                 for part in re.split(r"\n\s*\n", str(text)) if part.strip()]
     story = paragraphs(doc["title"], title_style) + paragraphs("摘要", heading) + paragraphs(doc["abstract"])
+    if doc.get("warnings"):
+        story += paragraphs("报告检查提醒", heading)
+        for warning in doc["warnings"]:
+            story += paragraphs(warning, small)
     for index, (title, text) in enumerate(doc["sections"], 1):
         story += paragraphs(f"{index}. {title}", heading) + paragraphs(text)
         if title == "研究结果" and doc["measurements"]:

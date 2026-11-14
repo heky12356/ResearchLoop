@@ -231,7 +231,7 @@ class ResearchEngine:
         chars = len(system or "") + len(text or "")
         return max(2048, chars // 2) + int(max_output)
 
-    def complete(self, system, prompt, schema, purpose="research_decision", role=None):
+    def complete(self, system, prompt, schema, purpose="research_decision", role=None, max_output=4096):
         """One admitted request, one trace record, including failed attempts."""
         cached = self.run.pop("pending_response", None)
         replay = self.run.pop("replay_response", False)
@@ -241,13 +241,21 @@ class ResearchEngine:
         self.guard_pause()
         route = routing.choose(self, purpose, prompt)
         model, source = route["model"], route["model_source"]
+        if source != "cloud":
+            max_output = 1500
         text = json.dumps(prompt, ensure_ascii=False) if isinstance(prompt, (dict, list)) else str(prompt)
-        reserve = self.reserve_for(system, text)
         if source!='cloud':
-            reserve=max(7644,reserve)  # Ollama context 6144 + at most 1500 generated tokens.
+            reserve=max(7644,self.reserve_for(system, text))  # Ollama context 6144 + at most 1500 generated tokens.
         else:
             # Cloud adds the schema to its prompt. UTF-8 bytes bound byte-tokenized input conservatively.
-            reserve=max(reserve,len((system+text+json.dumps(schema,ensure_ascii=False)).encode('utf-8'))+2012)
+            prompt_bound = max(self.reserve_for(system, text, max_output=0),
+                               len((system+text+json.dumps(schema,ensure_ascii=False)).encode('utf-8')))
+            if self.budget.token_limit is not None:
+                room = self.budget.token_limit - self.budget.used - prompt_bound
+                if room < 2012:
+                    raise BudgetError("剩余 token 不足以保守预留云端输入与完整输出")
+                max_output = min(max_output, room - 512)
+            reserve = prompt_bound + max(2012, max_output + 512)
         self.last_reserve = reserve
         self.budget.reserve(reserve)
         node = history.begin(self, "model_call", model=model, source=source, route=route,
@@ -264,7 +272,8 @@ class ResearchEngine:
                 def capture(value):
                     item.update(value)
                 client = cloudllm.Cloud(storage.settings()["cloud"], model, self.budget, on_call=capture)
-                parsed, _ = client.call(system, text, schema, purpose, self.run.get("seed"), reserve=reserve)
+                parsed, _ = client.call(system, text, schema, purpose, self.run.get("seed"),
+                                        max_output=max_output, reserve=reserve)
             else:
                 body = {"model": model, "stream": False, "think": False, "format": schema,
                         "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
@@ -329,7 +338,8 @@ class ResearchEngine:
                 ids = "、".join(e["id"] for e in verified)
                 hypotheses = "、".join(sorted({e["hypothesis_id"] for e in verified}))
                 system += f"\n本次citations必须包含已复核实验 {ids} 及其假设 {hypotheses}；只引用文献会使报告判为未完成。"
-        parsed, item = self.complete(system, prompt, schema)
+        parsed, item = self.complete(system, prompt, schema,
+                                     max_output=8192 if tool == "finish" else 4096)
         self.run.pop("pending_response", None)
         return {"tool": tool, "reason": f"按通用研究协议进入{tool}，研究内容由{item.get('source') == 'cloud' and '云端' or '本地'}模型生成",
                 "args": parsed, "source": item.get("source", "ollama")}
@@ -347,12 +357,12 @@ class ResearchEngine:
             if name in ("finish", "remember_fact"):
                 field = "citations" if name == "finish" else "evidence_ids"
                 properties[field] = {"type": "array", "items": {"type": "string"}}
-                identifiers = self.evidence_ids() if name == "finish" else self.memory_evidence_ids()
-                if identifiers:
-                    properties[field]["items"]["enum"] = identifiers
-                else:
-                    properties[field]["maxItems"] = 0
                 if name == "remember_fact":
+                    identifiers = self.memory_evidence_ids()
+                    if identifiers:
+                        properties[field]["items"]["enum"] = identifiers
+                    else:
+                        properties[field]["maxItems"] = 0
                     properties[field]["minItems"] = 1
                     required = [*required, "evidence_ids"]
             catalog.append({"tool": name, "description": entry.get("description", ""),
@@ -435,8 +445,8 @@ class ResearchEngine:
                                  "外部事实证据不足可继续取证；可执行的本地问题可先plan，再注册假设、实验及独立复核。"
                                  "实验完成后应复核并引用实验ID；无实测或来源证据时finish(citations=[])如实报告未完成。"
                                  "模拟只能回答模拟机制内的问题，不能替代真实世界所需的数据。"
-                                 "feasible=false 或 gap_fill.required 表示当前证据不足，不是终点：先换来源继续取证，"
-                                 "达到要求的尝试后才能重新 plan 或 finish；每次运行都要以报告结束。"
+                                 "feasible=false 或 gap_fill.required 表示当前证据不足：可以继续换来源取证并重新 plan，"
+                                 "也可用 finish 生成带明确缺口和检查提醒的未完成报告；每次运行都要以报告结束。"
                                  "如果需要多阶段编排，先调用design_workflow并写明每个阶段的设计理由。"}
         if "design_workflow" in options:
             prompt["role_tools"] = workflow_module.role_tools()
@@ -491,7 +501,9 @@ class ResearchEngine:
         for attempt in range(2):
             try:
                 parsed, item = self.complete(SYSTEM + writing + correction, prompt, schema,
-                                             purpose="agent_step" if attempt == 0 else "agent_step_retry")
+                                             purpose="agent_step" if attempt == 0 else "agent_step_retry",
+                                             max_output=8192 if report_stage or (attempt and
+                                                 prompt.get("repair", {}).get("truncated")) else 4096)
             except (BudgetError, history.Paused):
                 raise
             except Exception as error:
@@ -500,8 +512,16 @@ class ResearchEngine:
                 failure = reliability.classify(error)
                 if failure.get("retryable"):
                     self.wait_for_recovery(failure["retry_after"])
-                prompt["repair"] = {"error": str(error), "instruction": "重新返回满足schema的完整JSON对象"}
-                correction = "\n上次输出不是可解析的 JSON；只返回一个 JSON 对象，字段为 tool、reason、args。"
+                if isinstance(error, cloudllm.TruncatedCompletionError):
+                    prompt["repair"] = {
+                        "truncated": True, "error": str(error),
+                        "instruction": "上次输出因长度限制截断。重新生成独立完整的JSON；"
+                                       "若选择finish，只提供conclusion、citations、lesson，省略可选manuscript。"}
+                    correction = ("\n上次输出被截断。只返回完整的 tool/reason/args JSON；"
+                                  "finish 的 args 只需 conclusion、citations、lesson，不要续写截断内容。")
+                else:
+                    prompt["repair"] = {"error": str(error), "instruction": "重新返回满足schema的完整JSON对象"}
+                    correction = "\n上次输出不是可解析的 JSON；只返回一个 JSON 对象，字段为 tool、reason、args。"
                 continue
             self.run.pop("pending_response", None)
             issues = []
@@ -647,7 +667,6 @@ class ResearchEngine:
             names = [name for name in names if name in restrict]
         fill = run.get("gap_fill") or {}
         if fill.get("required"):
-            names = [name for name in names if name != "finish"]
             for candidate in ("inspect", "literature", "platform_search", "web_search", "web_fetch"):
                 if candidate in names:
                     continue
@@ -1189,24 +1208,35 @@ class ResearchEngine:
             return {"id": item["id"], **item["verification"]}
         if tool == "finish":
             fill = run.get("gap_fill") or {}
-            if fill.get("required") and not self.in_wrap_up():
-                tried = "、".join(fill.get("markers") or []) or "尚无"
-                raise ValueError(
-                    f"证据仍不足以收尾：已尝试 {fill.get('attempts', 0)}/{GAP_FILL_MIN} 种来源（{tried}）。"
-                    "请换关键词/别名、换平台、抓正文、查文献或读材料后再评估；完成不同取证后可重新 plan 或 finish。")
             role = (run.get("active_agent") or {}).get("role")
             if role and role != "reporter" and not self.in_wrap_up():
                 raise ValueError("只有报告角色可以结束研究；当前阶段请继续其职责，或让流程进入报告阶段")
             valid = {a["id"] for a in run["assets"]} | {p["id"] for p in run["sources"]} | {h["id"] for h in run["hypotheses"]} | {e["id"] for e in run["experiments"]}
+            warnings = []
+            if fill.get("required"):
+                warnings.append(
+                    f"研究计划尚有证据缺口；已尝试 {fill.get('attempts', 0)}/{GAP_FILL_MIN} 种来源。"
+                    "本报告只能说明现有记录，不能视为已完成的研究结论。")
             conclusion_text = str(args.get("conclusion") or "").strip()
-            if len(conclusion_text) < 10:
-                raise ValueError("finish需要至少10字符的研究结论；未完成时也要写明证据缺口，不能提交空报告")
-            citations = args.get("citations", [])
-            if not isinstance(citations, list) or any(c not in valid for c in citations):
-                run["draft_report"] = {"args": copy.deepcopy(args), "verified": False,
-                                       "errors": ["引用不在本轮证据集合"]}
-                raise reliability.Failure(f"报告只能引用本轮已存在的证据ID：{sorted(valid)}；记忆不是证据，无可用证据时使用 citations=[]。",
-                                          kind="invalid_citations")
+            raw_manuscript = args.get("manuscript")
+            if not conclusion_text:
+                conclusion_text = str(raw_manuscript.get("conclusion") or "").strip() if isinstance(raw_manuscript, dict) else ""
+            missing_conclusion = not conclusion_text
+            if not conclusion_text:
+                conclusion_text = "本轮未形成可核验的研究结论。"
+                warnings.append("模型未提供结论；报告仅汇总已有记录，不能视为已完成研究。")
+            raw_citations = args.get("citations", [])
+            if not isinstance(raw_citations, list):
+                raw_citations = []
+                warnings.append("引用列表格式无效；本轮没有从该列表采纳任何证据。")
+            citations = list(dict.fromkeys(c for c in raw_citations if isinstance(c, str) and c in valid))
+            unknown = [str(c) for c in raw_citations if not isinstance(c, str) or c not in valid]
+            if unknown:
+                warnings.append("引用列表中的证据 ID 不在本轮记录中，未采纳：" + "、".join(unknown[:10]))
+            manuscript, manuscript_warnings, added = reporting.review_manuscript(
+                raw_manuscript, citations, valid)
+            warnings.extend(manuscript_warnings)
+            citations.extend(added)
             verified = [e for e in run["experiments"] if e.get("verification") and e["id"] in citations]
             kind = run.get("research_kind") or self.infer_kind()
             run["research_kind"] = kind
@@ -1216,14 +1246,15 @@ class ResearchEngine:
             substantive = any(asset["id"] in citations for asset in run.get("assets", [])) or any(
                 document.get("asset_id") in citations for document in run.get("documents", [])) or any(
                 supportive)
-            report = {"conclusion": str(args.get("conclusion", "")), "citations": citations,
+            report = {"conclusion": conclusion_text, "citations": citations,
                       "lesson": str(args.get("lesson", ""))}
-            manuscript = reporting.validate_manuscript(args.get("manuscript"), citations)
             if manuscript:
                 report["manuscript"] = manuscript
+            if warnings:
+                report["warnings"] = warnings
 
             if kind in ("qualitative", "literature", "mixed"):
-                if substantive or (kind == "mixed" and verified):
+                if (substantive or (kind == "mixed" and verified)) and not missing_conclusion and not fill.get("required"):
                     report["evidence_scope_note"] = "来源评估的适用范围与局限：" + "；".join(
                         f"{review['source_id']}：{review['limitation']}" for review in supportive[:6]) if supportive else (
                         "本轮仅有用户材料或已复核的本地实验；不得外推未核实的真实世界效果。")
@@ -1234,11 +1265,15 @@ class ResearchEngine:
                         *[f"{review['source_id']}：{review['limitation']}" for review in reviewed if review][:3]]
                     run["status"] = "inconclusive"
             else:
-                run["status"] = "completed" if verified else "incomplete"
+                run["status"] = "completed" if verified and not missing_conclusion and not fill.get("required") else "incomplete"
+            if fill.get("required"):
+                run["status"] = "inconclusive"
+                report.setdefault("evidence_gaps", []).append(fill.get("reason") or "计划中的证据缺口尚未解决")
             run["report"] = report
             if run["status"] == "completed":
                 extratools.commit_report_facts(self, citations)
             return {"status": run["status"], "verified_experiments": len(verified),
+                    "warnings": warnings,
                     "evidence_gaps": report.get("evidence_gaps", []),
                     "note": "有复核记录不代表假设成立，须查看固定判据结果。"}
         raise ValueError(f"未开放工具 {tool}；请从可用工具选择")

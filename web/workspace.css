@@ -68,6 +68,10 @@ footer a{color:var(--muted)}
 .turn-answer-heading strong{font-size:14px;font-weight:600;color:var(--ink);margin-right:auto}
 .turn-answer>p{font-size:13px;line-height:1.95;margin:15px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
 .turn-answer>p.muted{color:var(--muted)}
+.report-warnings{margin-top:16px;padding:8px 0 8px 12px;border-left:3px solid #be813e;color:#775427;font-size:12px;line-height:1.7}
+.report-warnings strong{font-size:12px}
+.report-warnings ul{margin:5px 0 0;padding-left:18px}
+.report-warnings li{overflow-wrap:anywhere}
 .report-export{display:flex;align-items:center;gap:0;max-width:100%}
 .report-export select{width:auto;min-width:78px;border-radius:8px 0 0 8px;font-size:12px;padding:9px 10px;background:var(--card,#fff);border:1px solid var(--line);color:var(--ink)}
 .report-export .secondary-button{border-radius:0 8px 8px 0;margin-left:-1px;white-space:nowrap}

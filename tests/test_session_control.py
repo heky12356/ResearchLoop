@@ -149,6 +149,62 @@ class SessionControlTests(unittest.TestCase):
         self.assertEqual(engine.run['trace'][0]['status'], 'failed')
         self.assertNotIn('test-secret', json.dumps(engine.run))
 
+    def test_cloud_truncated_report_retries_with_complete_short_answer(self):
+        engine = self.engine()
+        engine.run['model_source'] = 'cloud'
+        engine.run['active_agent'] = {'id': 'g1', 'role': 'reporter',
+                                       'model': 'test-cloud', 'model_source': 'cloud'}
+        cfg = storage.settings()
+        cfg['cloud'] = {'enabled': True, 'base_url': 'https://example.com/v1',
+                        'model': 'test-cloud', 'api_key': 'test-secret'}
+        truncated = {'usage': {'prompt_tokens': 100, 'completion_tokens': 3135,
+                               'completion_tokens_details': {'reasoning_tokens': 1635}},
+                     'choices': [{'finish_reason': 'length', 'message': {
+                         'content': '{"tool":"finish","args":{"manuscript":{"discussion":"unfinished'}}]}
+        answer = {'tool': 'finish', 'reason': '根据现有证据收尾',
+                  'args': {'conclusion': '本轮资料不足，尚不能形成已核验的结论。',
+                           'citations': [], 'lesson': ''}}
+        complete = {'usage': {'prompt_tokens': 120, 'completion_tokens': 70},
+                    'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(answer)}}]}
+        requests = []
+        responses = iter([truncated, complete])
+
+        def respond(request, **kwargs):
+            requests.append(json.loads(request.data))
+            return io.BytesIO(json.dumps(next(responses)).encode())
+
+        with patch.object(storage, 'settings', return_value=cfg), \
+                patch('urllib.request.urlopen', side_effect=respond):
+            decision = engine.agent_step()
+        self.assertEqual(decision['tool'], 'finish')
+        self.assertEqual(decision['args']['citations'], [])
+        self.assertEqual([item['status'] for item in engine.run['calls']], ['error', 'ok'])
+        self.assertEqual(engine.budget.used, 100 + 3135 + 120 + 70)
+        self.assertEqual(engine.budget.cloud_calls, 2)
+        self.assertEqual([request['max_tokens'] for request in requests], [8192, 8192])
+        self.assertIn('省略可选manuscript', engine.run['trace'][1]['input']['prompt']['repair']['instruction'])
+        self.assertEqual(engine.run['trace'][0]['status'], 'failed')
+        self.assertNotIn('test-secret', json.dumps(engine.run))
+
+    def test_cloud_repeated_truncation_does_not_execute_partial_json(self):
+        engine = self.engine()
+        engine.run['model_source'] = 'cloud'
+        engine.run['active_agent'] = {'id': 'g1', 'role': 'reporter',
+                                       'model': 'test-cloud', 'model_source': 'cloud'}
+        cfg = storage.settings()
+        cfg['cloud'] = {'enabled': True, 'base_url': 'https://example.com/v1',
+                        'model': 'test-cloud', 'api_key': 'test-secret'}
+        response = {'usage': {'prompt_tokens': 10, 'completion_tokens': 40},
+                    'choices': [{'finish_reason': 'length',
+                                 'message': {'content': '{"tool":"finish","args":{"conclusion":"partial'}}]}
+        with patch.object(storage, 'settings', return_value=cfg), \
+                patch('urllib.request.urlopen', side_effect=lambda *a, **kw: io.BytesIO(json.dumps(response).encode())):
+            with self.assertRaisesRegex(RuntimeError, 'finish_reason=length'):
+                engine.agent_step()
+        self.assertEqual(engine.run['report'] if 'report' in engine.run else None, None)
+        self.assertEqual(engine.budget.used, 100)
+        self.assertEqual(len(engine.run['calls']), 2)
+
     def test_retry_routes_to_stronger_model_and_has_exact_repair_feedback(self):
         engine = self.engine(routing={'enabled': True, 'profiles': {
             'light': {'model_source': 'local', 'model': 'test-light'},
